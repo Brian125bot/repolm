@@ -91,6 +91,8 @@ export interface RepoSource {
   avatarUrl: string;
   lastSyncedAt: string;
   isPrivate: boolean;
+  isLocal?: boolean;
+  localPath?: string;
   totalFiles: number;
   totalLines: number;
   categoryCounts: {
@@ -182,8 +184,33 @@ export interface Notebook {
 }
 
 export interface IngestRepoParams {
-  repoUrl: string;
+  repoUrl?: string;
   ref?: string;
   githubToken?: string;
   pathFilter?: string;
+  isLocal?: boolean;
+  localPath?: string;
+  folderName?: string;
+  uploadedFiles?: Array<{ path: string; content: string }>;
+}
+
+export interface LocalScanResult {
+  path: string;
+  exists: boolean;
+  totalFiles: number;
+  detectedLanguages: string[];
+  previewFiles: Array<{ path: string; size: number; category: FileCategory }>;
+}
+
+export interface StorageStats {
+  totalNotebooks: number;
+  totalFiles: number;
+  totalChunks: number;
+  totalMessages: number;
+  totalNotes: number;
+  totalArtifacts: number;
+  diskUsageBytes: number;
+  storagePath: string;
+  isDiskAvailable: boolean;
+  lastSavedAt: string;
 }

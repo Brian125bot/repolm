@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import { Notebook } from '../types';
-import { useAuth } from '../context/AuthContext';
 import {
   BookOpen,
   Plus,
@@ -12,9 +11,9 @@ import {
   FileText,
   Copy,
   Check,
-  Cloud,
-  LogOut,
-  User as UserIcon,
+  FolderCode,
+  HardDrive,
+  CheckCircle2,
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -25,7 +24,6 @@ interface NavbarProps {
   onOpenSettings: () => void;
   onOpenDocs?: () => void;
   hasCustomToken: boolean;
-  isSyncing?: boolean;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -36,12 +34,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenSettings,
   onOpenDocs,
   hasCustomToken,
-  isSyncing,
 }) => {
-  const { user, profile, signOut } = useAuth();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
-  const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const handleExportJSON = () => {
@@ -103,6 +98,8 @@ export const Navbar: React.FC<NavbarProps> = ({
     }, 1500);
   };
 
+  const isLocal = activeNotebook?.source.isLocal;
+
   return (
     <header className="h-13 border-b border-[#30363D] bg-[#161B22] px-4 flex items-center justify-between z-30 shrink-0 select-none">
       {/* Brand & Active Notebook Switcher */}
@@ -126,6 +123,11 @@ export const Navbar: React.FC<NavbarProps> = ({
             className="flex items-center gap-2 px-2.5 py-1 rounded-md border border-[#30363D] bg-[#21262D] hover:bg-[#30363D] text-xs font-medium text-[#C9D1D9] hover:text-[#F0F6FC] transition min-w-[140px] max-w-[240px] justify-between cursor-pointer"
           >
             <div className="flex items-center gap-1.5 truncate">
+              {isLocal ? (
+                <FolderCode className="w-3.5 h-3.5 text-[#58A6FF] shrink-0" />
+              ) : (
+                <GitBranch className="w-3.5 h-3.5 text-[#3FB950] shrink-0" />
+              )}
               <span className="truncate">{activeNotebook?.source.fullName || 'Select Notebook'}</span>
             </div>
             <ChevronDown className="w-3.5 h-3.5 text-[#8B949E] shrink-0" />
@@ -138,10 +140,8 @@ export const Navbar: React.FC<NavbarProps> = ({
               onClick={() => setDropdownOpen(false)}
             >
               <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-[#8B949E] border-b border-[#30363D] flex items-center justify-between">
-                <span>My Cloud Notebooks ({notebooks.length})</span>
-                <span className="text-[9px] text-[#3FB950] flex items-center gap-1">
-                  <Cloud className="w-2.5 h-2.5" /> Firestore Synced
-                </span>
+                <span>Single-Repo Workspaces ({notebooks.length})</span>
+                <span className="text-[9px] text-[#3FB950] font-mono">Persisted</span>
               </div>
               <div className="max-h-60 overflow-y-auto py-1">
                 {notebooks.map((nb) => (
@@ -152,13 +152,19 @@ export const Navbar: React.FC<NavbarProps> = ({
                       activeNotebook?.id === nb.id ? 'bg-[#21262D] text-[#58A6FF] font-semibold' : 'text-[#C9D1D9]'
                     }`}
                   >
-                    <div className="truncate">
-                      <div className="truncate font-medium">{nb.source.fullName}</div>
-                      <div className="text-[10px] text-[#8B949E] flex items-center gap-1">
-                        <GitBranch className="w-2.5 h-2.5" />
-                        <span>{nb.source.selectedRef}</span>
-                        <span>&bull;</span>
-                        <span>{nb.files.length} files</span>
+                    <div className="truncate flex items-start gap-2">
+                      {nb.source.isLocal ? (
+                        <FolderCode className="w-3.5 h-3.5 text-[#58A6FF] shrink-0 mt-0.5" />
+                      ) : (
+                        <GitBranch className="w-3.5 h-3.5 text-[#3FB950] shrink-0 mt-0.5" />
+                      )}
+                      <div className="truncate">
+                        <div className="truncate font-medium">{nb.source.fullName}</div>
+                        <div className="text-[10px] text-[#8B949E] flex items-center gap-1 font-mono">
+                          <span>{nb.source.selectedRef || 'local'}</span>
+                          <span>&bull;</span>
+                          <span>{nb.files.length} files</span>
+                        </div>
                       </div>
                     </div>
                     {activeNotebook?.id === nb.id && (
@@ -176,7 +182,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-md bg-[#238636] hover:bg-[#2EA043] text-white font-medium transition cursor-pointer text-xs"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Create New Notebook</span>
+                  <span>Create / Ingest Notebook</span>
                 </button>
               </div>
             </div>
@@ -191,16 +197,20 @@ export const Navbar: React.FC<NavbarProps> = ({
             <span className="font-mono text-[#F0F6FC]">{activeNotebook.source.name}</span>
           </div>
         )}
-
-        {/* Cloud Sync Status */}
-        <div className="hidden xl:flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-medium text-[#8B949E]">
-          <Cloud className={`w-3 h-3 ${isSyncing ? 'text-amber-400 animate-pulse' : 'text-[#3FB950]'}`} />
-          <span>{isSyncing ? 'Syncing...' : 'Cloud Synced'}</span>
-        </div>
       </div>
 
       {/* Action Buttons */}
       <div className="flex items-center gap-2">
+        {/* Persistence Status Badge */}
+        <button
+          onClick={onOpenSettings}
+          className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#0D1117] border border-[#30363D] hover:border-[#3FB950]/50 text-[11px] font-mono text-[#8B949E] hover:text-[#C9D1D9] transition cursor-pointer"
+          title="Local disk & IndexedDB persistence active. Click to open storage manager."
+        >
+          <span className="w-2 h-2 rounded-full bg-[#3FB950]" />
+          <span>Persisted</span>
+        </button>
+
         <button
           id="nav-new-notebook-btn"
           onClick={onNewNotebook}
@@ -265,7 +275,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
         )}
 
-        {/* GitHub Token / Settings */}
+        {/* Settings & Persistence */}
         <button
           id="nav-settings-btn"
           onClick={onOpenSettings}
@@ -274,67 +284,12 @@ export const Navbar: React.FC<NavbarProps> = ({
               ? 'border-[#238636] bg-[#238636]/20 text-[#3FB950]'
               : 'border-[#30363D] bg-[#21262D] hover:bg-[#30363D] text-[#C9D1D9] hover:text-[#F0F6FC]'
           }`}
-          title={hasCustomToken ? 'GitHub Token Active' : 'Add GitHub Personal Token for private repos / rate limits'}
+          title="Local persistence, backup manager, and GitHub credentials"
         >
-          <Key className="w-3.5 h-3.5" />
-          <span className="hidden md:inline">{hasCustomToken ? 'Token Active' : 'GitHub Token'}</span>
+          <HardDrive className="w-3.5 h-3.5 text-[#58A6FF]" />
+          <span className="hidden md:inline">Storage & Settings</span>
         </button>
-
-        {/* User Account & Profile Menu */}
-        {user && (
-          <div className="relative ml-1">
-            <button
-              id="nav-user-profile-btn"
-              onClick={() => setUserMenuOpen(!userMenuOpen)}
-              className="flex items-center gap-1.5 p-1 rounded-full border border-[#30363D] bg-[#21262D] hover:bg-[#30363D] transition cursor-pointer"
-              title={`Logged in as ${user.email}`}
-            >
-              {user.photoURL ? (
-                <img
-                  src={user.photoURL}
-                  alt={user.displayName || 'User'}
-                  className="w-6 h-6 rounded-full object-cover"
-                  referrerPolicy="no-referrer"
-                />
-              ) : (
-                <div className="w-6 h-6 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[11px] font-bold">
-                  {user.email ? user.email.charAt(0).toUpperCase() : 'U'}
-                </div>
-              )}
-            </button>
-
-            {userMenuOpen && (
-              <div
-                className="absolute right-0 top-full mt-1.5 w-64 bg-[#161B22] border border-[#30363D] rounded-xl shadow-2xl py-2 z-50 text-xs animate-in fade-in"
-                onClick={() => setUserMenuOpen(false)}
-              >
-                <div className="px-3 py-2 border-b border-[#30363D]">
-                  <div className="font-semibold text-[#F0F6FC] truncate">
-                    {profile?.displayName || user.displayName || 'Researcher'}
-                  </div>
-                  <div className="text-[11px] text-[#8B949E] truncate">{user.email}</div>
-                  <div className="mt-2 flex items-center gap-1.5 text-[10px] text-[#3FB950] font-medium bg-[#238636]/10 px-2 py-0.5 rounded border border-[#238636]/30">
-                    <Cloud className="w-3 h-3" />
-                    <span>Firestore Cloud Sync Active</span>
-                  </div>
-                </div>
-
-                <div className="py-1">
-                  <button
-                    id="signout-button"
-                    onClick={() => signOut()}
-                    className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-rose-500/10 text-rose-300 transition cursor-pointer"
-                  >
-                    <LogOut className="w-3.5 h-3.5 text-rose-400" />
-                    <span>Sign Out</span>
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
       </div>
     </header>
   );
 };
-

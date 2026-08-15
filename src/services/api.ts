@@ -1,73 +1,114 @@
-import { Notebook, IngestRepoParams, AnswerMode, ArtifactType, Artifact, Note, Citation, GeminiModelId } from '../types';
-import { getSampleZustandNotebook } from '../sampleRepos';
+import {
+  Notebook,
+  IngestRepoParams,
+  AnswerMode,
+  ArtifactType,
+  Artifact,
+  Note,
+  Citation,
+  GeminiModelId,
+  LocalScanResult,
+  StorageStats,
+} from '../types';
+import {
+  loadPersistentNotebooks,
+  getInitialNotebooksSync,
+  savePersistentNotebooks,
+  getSavedActiveNotebookId,
+  saveActiveNotebookId,
+  getSavedGitHubToken,
+  saveGitHubToken,
+  getStorageDiagnostics,
+  exportAllDataAsJSON,
+  importDataFromJSON,
+} from './storage';
 
-const STORAGE_KEY_NOTEBOOKS = 'reponotebook_saved_notebooks_v1';
-const STORAGE_KEY_ACTIVE_ID = 'reponotebook_active_notebook_id_v1';
-const STORAGE_KEY_GITHUB_TOKEN = 'reponotebook_github_token_v1';
+// Re-export storage functions
+export {
+  loadPersistentNotebooks,
+  getInitialNotebooksSync as getSavedNotebooks,
+  savePersistentNotebooks as saveNotebooks,
+  getSavedActiveNotebookId as getActiveNotebookId,
+  saveActiveNotebookId as setActiveNotebookId,
+  getSavedGitHubToken,
+  saveGitHubToken,
+  getStorageDiagnostics,
+  exportAllDataAsJSON,
+  importDataFromJSON,
+};
 
-export function getSavedGitHubToken(): string {
-  try {
-    return localStorage.getItem(STORAGE_KEY_GITHUB_TOKEN) || '';
-  } catch {
-    return '';
+/**
+ * Scan a local directory on the server/machine filesystem
+ */
+export async function scanLocalDirectory(localPath?: string): Promise<LocalScanResult> {
+  const response = await fetch('/api/local/scan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ localPath }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({ error: 'Failed to scan local path' }));
+    throw new Error(errData.error || `HTTP ${response.status}: Directory scan failed`);
   }
+
+  return response.json();
 }
 
-export function saveGitHubToken(token: string): void {
-  try {
-    if (token) {
-      localStorage.setItem(STORAGE_KEY_GITHUB_TOKEN, token);
-    } else {
-      localStorage.removeItem(STORAGE_KEY_GITHUB_TOKEN);
-    }
-  } catch (e) {
-    console.error('Failed to save GitHub token', e);
-  }
-}
-
-export function getSavedNotebooks(): Notebook[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY_NOTEBOOKS);
-    if (!raw) {
-      const demo = getSampleZustandNotebook();
-      saveNotebooks([demo]);
-      return [demo];
-    }
-    return JSON.parse(raw);
-  } catch {
-    return [getSampleZustandNotebook()];
-  }
-}
-
-export function saveNotebooks(notebooks: Notebook[]): void {
-  try {
-    localStorage.setItem(STORAGE_KEY_NOTEBOOKS, JSON.stringify(notebooks));
-  } catch (e) {
-    console.error('Failed to save notebooks locally', e);
-  }
-}
-
-export function getActiveNotebookId(): string {
-  try {
-    return localStorage.getItem(STORAGE_KEY_ACTIVE_ID) || 'demo-zustand-notebook';
-  } catch {
-    return 'demo-zustand-notebook';
-  }
-}
-
-export function setActiveNotebookId(id: string): void {
-  try {
-    localStorage.setItem(STORAGE_KEY_ACTIVE_ID, id);
-  } catch (e) {
-    console.error('Failed to set active notebook id', e);
-  }
-}
-
+/**
+ * Ingest a repository (GitHub URL, Local Directory, or Browser Folder Upload)
+ */
 export async function ingestRepository(params: IngestRepoParams): Promise<{
   notebook: Notebook;
   rateLimitNotice?: string;
   isSampleFallback?: boolean;
 }> {
+  // Case 1: Browser Uploaded Files (drag-and-drop or folder picker)
+  if (params.uploadedFiles && params.uploadedFiles.length > 0) {
+    const response = await fetch('/api/local/upload-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folderName: params.folderName || 'local-repo',
+        uploadedFiles: params.uploadedFiles,
+      }),
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({ error: 'Failed to ingest uploaded folder' }));
+      throw new Error(errData.error || `HTTP ${response.status}: Ingestion failed`);
+    }
+
+    const data = await response.json();
+    return {
+      notebook: data.notebook,
+    };
+  }
+
+  // Case 2: Local Directory on Server / Host Machine
+  if (params.isLocal || params.localPath) {
+    const response = await fetch('/api/local/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        localPath: params.localPath || './',
+        folderName: params.folderName,
+        pathFilter: params.pathFilter,
+      }),
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({ error: 'Failed to ingest local directory' }));
+      throw new Error(errData.error || `HTTP ${response.status}: Ingestion failed`);
+    }
+
+    const data = await response.json();
+    return {
+      notebook: data.notebook,
+    };
+  }
+
+  // Case 3: GitHub Remote Repository
   const token = params.githubToken || getSavedGitHubToken();
   const response = await fetch('/api/repo/ingest', {
     method: 'POST',
@@ -109,6 +150,7 @@ export async function ingestRepository(params: IngestRepoParams): Promise<{
 - **Files Indexed**: ${data.files.length} (${data.chunks.length} semantic chunks)
 - **Primary Language**: ${data.source.primaryLanguage}
 - **Categories**: ${data.source.categoryCounts.doc} Docs, ${data.source.categoryCounts.code} Source files, ${data.source.categoryCounts.config} Configs, ${data.source.categoryCounts.test} Tests, ${data.source.categoryCounts.workflow} Workflows
+- **Persistence**: Saved automatically to local disk and IndexedDB.
 
 *Every response in this notebook is strictly grounded in this repository with exact file and line citations.*`,
         citations: data.files.length > 0 ? [

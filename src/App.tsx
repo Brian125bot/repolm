@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Notebook,
   SourceFile,
@@ -9,30 +9,18 @@ import {
   Note,
   IngestRepoParams,
   GeminiModelId,
-  Artifact,
 } from './types';
 import {
+  getSavedNotebooks,
+  saveNotebooks,
+  loadPersistentNotebooks,
+  getActiveNotebookId,
+  setActiveNotebookId,
   getSavedGitHubToken,
   ingestRepository,
   askRepoQuestion,
   generateRepoArtifact,
 } from './services/api';
-import { getSampleZustandNotebook } from './sampleRepos';
-import { AuthProvider, useAuth } from './context/AuthContext';
-import { AuthScreen } from './components/AuthScreen';
-import {
-  subscribeToUserNotebooks,
-  subscribeToUserNotes,
-  subscribeToUserArtifacts,
-  subscribeToNotebookMessages,
-  saveNotebookToFirestore,
-  deleteNotebookFromFirestore,
-  saveNoteToFirestore,
-  deleteNoteFromFirestore,
-  saveArtifactToFirestore,
-  deleteArtifactFromFirestore,
-  saveChatMessageToFirestore,
-} from './services/firebaseDb';
 import { Navbar } from './components/Navbar';
 import { SourcePanel } from './components/SourcePanel';
 import { ChatPanel } from './components/ChatPanel';
@@ -48,19 +36,28 @@ import {
   PanelRightOpen,
   FolderTree,
   Sparkles,
-  Loader2,
-  BookOpen,
 } from 'lucide-react';
 
-function AppContent() {
-  const { user, loading: authLoading } = useAuth();
-
-  const [notebooks, setNotebooks] = useState<Notebook[]>([]);
-  const [activeId, setActiveId] = useState<string>('');
+export default function App() {
+  const [notebooks, setNotebooks] = useState<Notebook[]>(() => getSavedNotebooks());
+  const [activeId, setActiveId] = useState<string>(() => getActiveNotebookId());
   const [viewMode, setViewMode] = useState<'workspace' | 'home'>('workspace');
   const [githubToken, setGithubToken] = useState<string>(() => getSavedGitHubToken());
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
+
+  // Load from persistent disk / IndexedDB on startup
+  useEffect(() => {
+    async function initStorage() {
+      try {
+        const persisted = await loadPersistentNotebooks();
+        if (persisted && persisted.length > 0) {
+          setNotebooks(persisted);
+        }
+      } catch (err) {
+        console.warn('Persistent storage load notice:', err);
+      }
+    }
+    initStorage();
+  }, []);
 
   // Panel collapse states
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
@@ -85,103 +82,22 @@ function AppContent() {
   const [isReindexing, setIsReindexing] = useState(false);
   const [notification, setNotification] = useState<string | null>(null);
 
-  const seededRef = useRef(false);
-
-  const showNotification = useCallback((msg: string) => {
-    setNotification(msg);
-    setTimeout(() => setNotification(null), 4000);
-  }, []);
-
-  // 1. Subscribe to User's Notebooks in Firestore
+  // Save notebooks to persistent multi-tier storage (IndexedDB + Disk Sync + LocalStorage)
   useEffect(() => {
-    if (!user) {
-      setNotebooks([]);
-      setIsInitialLoad(false);
-      return;
-    }
+    saveNotebooks(notebooks);
+  }, [notebooks]);
 
-    const unsubscribe = subscribeToUserNotebooks(
-      user.uid,
-      async (cloudNotebooks) => {
-        if (cloudNotebooks.length === 0 && !seededRef.current) {
-          seededRef.current = true;
-          // Seed initial starter notebook in Firestore for this user
-          const sample = getSampleZustandNotebook();
-          try {
-            await saveNotebookToFirestore(user.uid, sample);
-            // Also seed sample notes and artifacts
-            for (const note of sample.notes) {
-              await saveNoteToFirestore(user.uid, note);
-            }
-            for (const art of sample.artifacts) {
-              await saveArtifactToFirestore(user.uid, art);
-            }
-            for (const msg of sample.messages) {
-              await saveChatMessageToFirestore(user.uid, sample.id, msg);
-            }
-          } catch (e) {
-            console.error('Failed to seed starter notebook', e);
-          }
-        } else {
-          setNotebooks(cloudNotebooks);
-          setActiveId((prev) => {
-            if (prev && cloudNotebooks.some((n) => n.id === prev)) return prev;
-            return cloudNotebooks[0]?.id || '';
-          });
-        }
-        setIsInitialLoad(false);
-      },
-      (err) => {
-        console.error('Notebook subscription error', err);
-        setIsInitialLoad(false);
-      }
-    );
-
-    return () => unsubscribe();
-  }, [user]);
-
-  // 2. Subscribe to Notes for Active Notebook
+  // Sync active notebook ID
   useEffect(() => {
-    if (!user || !activeId) return;
-
-    const unsubscribe = subscribeToUserNotes(user.uid, activeId, (cloudNotes) => {
-      setNotebooks((prev) =>
-        prev.map((nb) => (nb.id === activeId ? { ...nb, notes: cloudNotes } : nb))
-      );
-    });
-
-    return () => unsubscribe();
-  }, [user, activeId]);
-
-  // 3. Subscribe to Artifacts for Active Notebook
-  useEffect(() => {
-    if (!user || !activeId) return;
-
-    const unsubscribe = subscribeToUserArtifacts(user.uid, activeId, (cloudArtifacts) => {
-      setNotebooks((prev) =>
-        prev.map((nb) => (nb.id === activeId ? { ...nb, artifacts: cloudArtifacts } : nb))
-      );
-    });
-
-    return () => unsubscribe();
-  }, [user, activeId]);
-
-  // 4. Subscribe to Messages for Active Notebook
-  useEffect(() => {
-    if (!user || !activeId) return;
-
-    const unsubscribe = subscribeToNotebookMessages(user.uid, activeId, (cloudMessages) => {
-      if (cloudMessages.length > 0) {
-        setNotebooks((prev) =>
-          prev.map((nb) => (nb.id === activeId ? { ...nb, messages: cloudMessages } : nb))
-        );
-      }
-    });
-
-    return () => unsubscribe();
-  }, [user, activeId]);
+    setActiveNotebookId(activeId);
+  }, [activeId]);
 
   const activeNotebook = notebooks.find((n) => n.id === activeId) || notebooks[0] || null;
+
+  const showNotification = (msg: string) => {
+    setNotification(msg);
+    setTimeout(() => setNotification(null), 4000);
+  };
 
   // Switch active notebook
   const handleSelectNotebook = (id: string) => {
@@ -216,9 +132,9 @@ function AppContent() {
     }
   };
 
-  // Send message in chat with Firestore sync
+  // Send message in chat
   const handleSendMessage = async (question: string, model?: GeminiModelId) => {
-    if (!activeNotebook || isQuerying || !user) return;
+    if (!activeNotebook || isQuerying) return;
 
     const userMessage: ChatMessage = {
       id: `msg-user-${Date.now()}`,
@@ -238,12 +154,8 @@ function AppContent() {
 
     setNotebooks((prev) => prev.map((n) => (n.id === activeNotebook.id ? updatedNotebook : n)));
     setIsQuerying(true);
-    setIsSyncing(true);
 
     try {
-      // Persist user message to Firestore
-      await saveChatMessageToFirestore(user.uid, activeNotebook.id, userMessage);
-
       const response = await askRepoQuestion({
         question,
         notebook: updatedNotebook,
@@ -270,9 +182,6 @@ function AppContent() {
       };
 
       setNotebooks((prev) => prev.map((n) => (n.id === activeNotebook.id ? finalNotebook : n)));
-
-      // Persist assistant response to Firestore
-      await saveChatMessageToFirestore(user.uid, activeNotebook.id, assistantMessage);
     } catch (err: any) {
       const errorMessage: ChatMessage = {
         id: `msg-err-${Date.now()}`,
@@ -292,17 +201,15 @@ function AppContent() {
       );
     } finally {
       setIsQuerying(false);
-      setIsSyncing(false);
     }
   };
 
-  // Generate research artifact with Firestore sync
+  // Generate research artifact
   const handleGenerateArtifact = async (type: ArtifactType) => {
-    if (!activeNotebook || isGeneratingArtifact || !user) return;
+    if (!activeNotebook || isGeneratingArtifact) return;
 
     setIsGeneratingArtifact(true);
     setGeneratingArtifactType(type);
-    setIsSyncing(true);
 
     try {
       const artifact = await generateRepoArtifact({
@@ -322,36 +229,33 @@ function AppContent() {
       };
 
       setNotebooks((prev) => prev.map((n) => (n.id === activeNotebook.id ? updatedNotebook : n)));
-
-      // Persist artifact to Firestore
-      await saveArtifactToFirestore(user.uid, artifact);
-      showNotification(`Artifact "${artifact.title}" saved to your cloud account!`);
+      showNotification(`Artifact "${artifact.title}" generated with repo citations!`);
     } catch (err: any) {
       alert(`Artifact generation failed: ${err.message}`);
     } finally {
       setIsGeneratingArtifact(false);
       setGeneratingArtifactType(null);
-      setIsSyncing(false);
     }
   };
 
-  // Save/Edit note with Firestore sync
-  const handleSaveNote = async (partialNote: Partial<Note>) => {
-    if (!activeNotebook || !user) return;
+  // Save/Edit note
+  const handleSaveNote = (partialNote: Partial<Note>) => {
+    if (!activeNotebook) return;
 
-    setIsSyncing(true);
     const existingIndex = activeNotebook.notes.findIndex((n) => n.id === partialNote.id);
-    let noteToSave: Note;
+    let updatedNotes: Note[];
 
     if (existingIndex >= 0) {
       const existing = activeNotebook.notes[existingIndex];
-      noteToSave = {
+      const updated: Note = {
         ...existing,
         ...partialNote,
         updatedAt: new Date().toISOString(),
       } as Note;
+      updatedNotes = [...activeNotebook.notes];
+      updatedNotes[existingIndex] = updated;
     } else {
-      noteToSave = {
+      const newNote: Note = {
         id: partialNote.id || `note-${Date.now()}`,
         notebookId: activeNotebook.id,
         title: partialNote.title || 'Untitled Note',
@@ -361,28 +265,15 @@ function AppContent() {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
+      updatedNotes = [newNote, ...activeNotebook.notes];
     }
 
-    // Optimistic update
     setNotebooks((prev) =>
-      prev.map((n) => {
-        if (n.id !== activeNotebook.id) return n;
-        const exists = n.notes.some((item) => item.id === noteToSave.id);
-        const newNotes = exists
-          ? n.notes.map((item) => (item.id === noteToSave.id ? noteToSave : item))
-          : [noteToSave, ...n.notes];
-        return { ...n, notes: newNotes, updatedAt: new Date().toISOString() };
-      })
+      prev.map((n) =>
+        n.id === activeNotebook.id ? { ...n, notes: updatedNotes, updatedAt: new Date().toISOString() } : n
+      )
     );
-
-    try {
-      await saveNoteToFirestore(user.uid, noteToSave);
-      showNotification('Note synced to cloud account!');
-    } catch (err) {
-      console.error('Failed to save note to Firestore', err);
-    } finally {
-      setIsSyncing(false);
-    }
+    showNotification('Note saved to notebook studio!');
   };
 
   // Save chat response as note
@@ -403,104 +294,74 @@ function AppContent() {
     });
   };
 
-  // Delete note from Firestore & state
-  const handleDeleteNote = async (noteId: string) => {
-    if (!activeNotebook || !user) return;
-    setIsSyncing(true);
+  // Delete note
+  const handleDeleteNote = (noteId: string) => {
+    if (!activeNotebook) return;
     const updatedNotes = activeNotebook.notes.filter((n) => n.id !== noteId);
     setNotebooks((prev) =>
       prev.map((n) => (n.id === activeNotebook.id ? { ...n, notes: updatedNotes } : n))
     );
-
-    try {
-      await deleteNoteFromFirestore(user.uid, noteId);
-      showNotification('Note deleted from cloud account.');
-    } catch (err) {
-      console.error('Failed to delete note from Firestore', err);
-    } finally {
-      setIsSyncing(false);
-    }
+    showNotification('Note deleted.');
   };
 
   // Pin citation
-  const handlePinCitation = async (citation: Citation) => {
-    if (!activeNotebook || !user) return;
+  const handlePinCitation = (citation: Citation) => {
+    if (!activeNotebook) return;
     const alreadyPinned = activeNotebook.pinnedCitations.some((c) => c.id === citation.id);
     if (alreadyPinned) return;
 
     const updatedPins = [citation, ...activeNotebook.pinnedCitations];
-    const updatedNotebook = { ...activeNotebook, pinnedCitations: updatedPins };
     setNotebooks((prev) =>
-      prev.map((n) => (n.id === activeNotebook.id ? updatedNotebook : n))
+      prev.map((n) => (n.id === activeNotebook.id ? { ...n, pinnedCitations: updatedPins } : n))
     );
     showNotification(`Pinned ${citation.filePath}:${citation.startLine}`);
-
-    try {
-      await saveNotebookToFirestore(user.uid, updatedNotebook);
-    } catch (e) {
-      console.error('Failed to save pinned citation', e);
-    }
   };
 
   // Unpin citation
-  const handleUnpinCitation = async (citationId: string) => {
-    if (!activeNotebook || !user) return;
+  const handleUnpinCitation = (citationId: string) => {
+    if (!activeNotebook) return;
     const updatedPins = activeNotebook.pinnedCitations.filter((c) => c.id !== citationId);
-    const updatedNotebook = { ...activeNotebook, pinnedCitations: updatedPins };
     setNotebooks((prev) =>
-      prev.map((n) => (n.id === activeNotebook.id ? updatedNotebook : n))
+      prev.map((n) => (n.id === activeNotebook.id ? { ...n, pinnedCitations: updatedPins } : n))
     );
-
-    try {
-      await saveNotebookToFirestore(user.uid, updatedNotebook);
-    } catch (e) {
-      console.error('Failed to update unpin citation', e);
-    }
   };
 
-  // Ingest a new repository & save to Firestore
+  // Ingest a new repository (GitHub, Local Directory, or Browser Upload)
   const handleIngestRepo = async (params: IngestRepoParams) => {
-    if (!user) return;
     setIsIngesting(true);
-    setIsSyncing(true);
     try {
       const result = await ingestRepository(params);
-      setNotebooks((prev) => [result.notebook, ...prev]);
+      setNotebooks((prev) => [result.notebook, ...prev.filter((n) => n.id !== result.notebook.id)]);
       setActiveId(result.notebook.id);
       setViewMode('workspace');
       setIsNewNotebookOpen(false);
 
-      // Save new notebook to Firestore
-      await saveNotebookToFirestore(user.uid, result.notebook);
-      for (const msg of result.notebook.messages) {
-        await saveChatMessageToFirestore(user.uid, result.notebook.id, msg);
-      }
-
       if (result.rateLimitNotice) {
         showNotification(result.rateLimitNotice);
       } else {
-        showNotification(`Repository ${result.notebook.source.fullName} indexed & saved to cloud!`);
+        showNotification(`Workspace ${result.notebook.source.fullName} indexed & persisted successfully!`);
       }
     } catch (err: any) {
       throw err;
     } finally {
       setIsIngesting(false);
-      setIsSyncing(false);
     }
   };
 
-  // Re-index active repo & sync to Firestore
+  // Re-index active repo or local folder
   const handleReindex = async () => {
-    if (!activeNotebook || isReindexing || !user) return;
+    if (!activeNotebook || isReindexing) return;
     setIsReindexing(true);
-    setIsSyncing(true);
     try {
       const result = await ingestRepository({
+        isLocal: activeNotebook.source.isLocal,
+        localPath: activeNotebook.source.localPath,
         repoUrl: activeNotebook.source.repoUrl,
         ref: activeNotebook.source.selectedRef,
         pathFilter: activeNotebook.pathFilter,
       });
 
+      // Preserve existing user notes and chat messages while updating files/chunks
       const refreshedNotebook: Notebook = {
         ...result.notebook,
         id: activeNotebook.id,
@@ -511,38 +372,28 @@ function AppContent() {
       };
 
       setNotebooks((prev) => prev.map((n) => (n.id === activeNotebook.id ? refreshedNotebook : n)));
-      await saveNotebookToFirestore(user.uid, refreshedNotebook);
-      showNotification('Repository re-indexed and synchronized!');
+      showNotification('Codebase re-indexed successfully!');
     } catch (err: any) {
       alert(`Re-index failed: ${err.message}`);
     } finally {
       setIsReindexing(false);
-      setIsSyncing(false);
     }
   };
 
-  // Delete notebook from Firestore & state
-  const handleDeleteNotebook = async (id: string) => {
-    if (!user) return;
+  // Delete notebook
+  const handleDeleteNotebook = (id: string) => {
     const remaining = notebooks.filter((n) => n.id !== id);
     if (remaining.length === 0) return;
-
     setNotebooks(remaining);
     if (activeId === id) {
       setActiveId(remaining[0].id);
     }
-    showNotification('Notebook removed from cloud.');
-
-    try {
-      await deleteNotebookFromFirestore(user.uid, id);
-    } catch (err) {
-      console.error('Failed to delete notebook from Firestore', err);
-    }
+    showNotification('Notebook removed.');
   };
 
   // Clear center panel chat history for active repository
-  const handleClearChat = async () => {
-    if (!activeNotebook || !user) return;
+  const handleClearChat = () => {
+    if (!activeNotebook) return;
     const clearedNotebook: Notebook = {
       ...activeNotebook,
       messages: [],
@@ -552,33 +403,7 @@ function AppContent() {
       prev.map((n) => (n.id === activeNotebook.id ? clearedNotebook : n))
     );
     showNotification(`Chat history cleared for ${activeNotebook.source.name}.`);
-
-    try {
-      await saveNotebookToFirestore(user.uid, clearedNotebook);
-    } catch (e) {
-      console.error('Failed to save cleared chat', e);
-    }
   };
-
-  // Loading state while checking auth
-  if (authLoading || (user && isInitialLoad)) {
-    return (
-      <div className="h-screen w-screen bg-[#0D1117] flex flex-col items-center justify-center text-[#C9D1D9] gap-4">
-        <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-xl animate-pulse">
-          <BookOpen className="w-6 h-6" />
-        </div>
-        <div className="flex items-center gap-2 text-sm text-[#8B949E]">
-          <Loader2 className="w-4 h-4 animate-spin text-[#58A6FF]" />
-          <span>Connecting to your cloud workspace...</span>
-        </div>
-      </div>
-    );
-  }
-
-  // Auth gate: If not authenticated, require login
-  if (!user) {
-    return <AuthScreen />;
-  }
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#0D1117] text-[#C9D1D9] font-sans antialiased">
@@ -591,12 +416,11 @@ function AppContent() {
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenDocs={() => setIsDocsOpen(true)}
         hasCustomToken={Boolean(githubToken)}
-        isSyncing={isSyncing}
       />
 
       {/* Floating Notification Toast */}
       {notification && (
-        <div className="fixed top-16 right-6 z-50 bg-[#161B22] text-[#F0F6FC] text-xs font-medium px-4 py-2.5 rounded-lg shadow-xl border border-[#30363D] animate-in fade-in slide-in-from-top-2 flex items-center gap-2">
+        <div className="fixed top-16 right-6 z-50 bg-[#161B22] text-[#F0F6FC] text-xs font-medium px-4 py-2.5 rounded-lg shadow-xl border border-[#30363D] animate-in fade-in slide-in-from-top-2 flex items-center gap-2 font-mono">
           <span className="w-2 h-2 rounded-full bg-[#58A6FF]" />
           <span>{notification}</span>
         </div>
@@ -747,6 +571,8 @@ function AppContent() {
         onClose={() => setIsSettingsOpen(false)}
         savedToken={githubToken}
         onTokenUpdated={(token) => setGithubToken(token)}
+        notebooks={notebooks}
+        onNotebooksUpdated={(updated) => setNotebooks(updated)}
       />
 
       {activeNotebook && (
@@ -771,12 +597,3 @@ function AppContent() {
     </div>
   );
 }
-
-export default function App() {
-  return (
-    <AuthProvider>
-      <AppContent />
-    </AuthProvider>
-  );
-}
-

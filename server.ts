@@ -1,13 +1,55 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import fsPromises from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { FileChunk, SourceFile, RepoSource, Citation, AnswerMode, ArtifactType } from './src/types';
+import { FileChunk, SourceFile, RepoSource, Citation, AnswerMode, ArtifactType, Notebook } from './src/types';
 import { createChunksFromFile, getSampleZustandNotebook } from './src/sampleRepos';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Local Disk Persistence Storage Setup
+const DATA_DIR = path.join(process.cwd(), '.reponotebook_data');
+const DATA_FILE = path.join(DATA_DIR, 'notebooks.json');
+
+async function ensureStorageDir(): Promise<void> {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      await fsPromises.mkdir(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(DATA_FILE)) {
+      const demo = getSampleZustandNotebook();
+      await fsPromises.writeFile(DATA_FILE, JSON.stringify([demo], null, 2), 'utf-8');
+    }
+  } catch (err) {
+    console.warn('[Storage] ensureStorageDir notice:', err);
+  }
+}
+
+async function readStoredNotebooks(): Promise<Notebook[]> {
+  await ensureStorageDir();
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = await fsPromises.readFile(DATA_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch (err) {
+    console.warn('[Storage] Failed to read stored notebooks:', err);
+  }
+  const demo = getSampleZustandNotebook();
+  return [demo];
+}
+
+async function writeStoredNotebooks(notebooks: Notebook[]): Promise<void> {
+  await ensureStorageDir();
+  await fsPromises.writeFile(DATA_FILE, JSON.stringify(notebooks, null, 2), 'utf-8');
+}
 
 // Initialize Gemini SDK with User-Agent header
 const ai = new GoogleGenAI({
@@ -22,11 +64,88 @@ const ai = new GoogleGenAI({
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // Healthcheck
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    mode: 'local-optimized',
+    storage: 'disk-persistent',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Storage Endpoints
+app.get('/api/storage/status', async (_req, res) => {
+  try {
+    await ensureStorageDir();
+    const notebooks = await readStoredNotebooks();
+    let size = 0;
+    let mtime = new Date();
+    try {
+      const stat = await fsPromises.stat(DATA_FILE);
+      size = stat.size;
+      mtime = stat.mtime;
+    } catch {
+      size = JSON.stringify(notebooks).length;
+    }
+
+    const totalFiles = notebooks.reduce((acc, n) => acc + (n.files?.length || 0), 0);
+    const totalChunks = notebooks.reduce((acc, n) => acc + (n.chunks?.length || 0), 0);
+    const totalMessages = notebooks.reduce((acc, n) => acc + (n.messages?.length || 0), 0);
+    const totalNotes = notebooks.reduce((acc, n) => acc + (n.notes?.length || 0), 0);
+    const totalArtifacts = notebooks.reduce((acc, n) => acc + (n.artifacts?.length || 0), 0);
+
+    res.json({
+      totalNotebooks: notebooks.length,
+      totalFiles,
+      totalChunks,
+      totalMessages,
+      totalNotes,
+      totalArtifacts,
+      diskUsageBytes: size,
+      storagePath: '.reponotebook_data/notebooks.json',
+      isDiskAvailable: true,
+      lastSavedAt: mtime instanceof Date ? mtime.toISOString() : new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to read storage status' });
+  }
+});
+
+app.get('/api/storage/notebooks', async (_req, res) => {
+  try {
+    const notebooks = await readStoredNotebooks();
+    res.json({ notebooks });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch notebooks' });
+  }
+});
+
+app.post('/api/storage/notebooks', async (req, res) => {
+  const { notebooks } = req.body;
+  if (!Array.isArray(notebooks)) {
+    return res.status(400).json({ error: 'Expected an array of notebooks' });
+  }
+  try {
+    await writeStoredNotebooks(notebooks);
+    res.json({ success: true, count: notebooks.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to write notebooks to disk' });
+  }
+});
+
+app.delete('/api/storage/notebooks/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const notebooks = await readStoredNotebooks();
+    const filtered = notebooks.filter((n) => n.id !== id);
+    await writeStoredNotebooks(filtered);
+    res.json({ success: true, remaining: filtered.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to delete notebook' });
+  }
 });
 
 // Helper to determine file category
@@ -137,6 +256,468 @@ function parseGitHubUrl(rawUrl: string): { owner: string; repo: string } | null 
   }
   return null;
 }
+
+// Local Directory Recursive Scanner
+const IGNORED_LOCAL_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.next',
+  'dist',
+  'build',
+  '.reponotebook_data',
+  '.idea',
+  '.vscode',
+  '.cache',
+  'coverage',
+  '__pycache__',
+  'target',
+  'vendor',
+  '.turbo',
+  '.output',
+]);
+
+const BINARY_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.ico',
+  '.pdf',
+  '.zip',
+  '.tar',
+  '.gz',
+  '.mp4',
+  '.mp3',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.eot',
+  '.exe',
+  '.dll',
+  '.bin',
+  '.lock',
+  '.map',
+]);
+
+async function scanLocalDirectoryTree(
+  dirPath: string,
+  basePath: string = dirPath,
+  maxDepth: number = 7,
+  currentDepth: number = 0
+): Promise<Array<{ fullPath: string; relPath: string; size: number }>> {
+  if (currentDepth > maxDepth) return [];
+  try {
+    const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
+    const results: Array<{ fullPath: string; relPath: string; size: number }> = [];
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && entry.name !== '.env.example' && entry.name !== '.github') {
+        continue;
+      }
+      if (IGNORED_LOCAL_DIRS.has(entry.name)) continue;
+
+      const full = path.join(dirPath, entry.name);
+      const rel = path.relative(basePath, full).replace(/\\/g, '/');
+
+      if (entry.isDirectory()) {
+        const sub = await scanLocalDirectoryTree(full, basePath, maxDepth, currentDepth + 1);
+        results.push(...sub);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (
+          BINARY_EXTENSIONS.has(ext) ||
+          entry.name === 'package-lock.json' ||
+          entry.name === 'yarn.lock' ||
+          entry.name === 'pnpm-lock.yaml'
+        ) {
+          continue;
+        }
+
+        try {
+          const stat = await fsPromises.stat(full);
+          if (stat.size <= 250000) {
+            results.push({ fullPath: full, relPath: rel, size: stat.size });
+          }
+        } catch {
+          // skip unreadable
+        }
+      }
+    }
+    return results;
+  } catch (e) {
+    return [];
+  }
+}
+
+// Local Scan Preview Endpoint
+app.post('/api/local/scan', async (req, res) => {
+  const { localPath } = req.body;
+  const targetDir = localPath ? path.resolve(process.cwd(), localPath.trim()) : process.cwd();
+
+  try {
+    if (!fs.existsSync(targetDir)) {
+      return res.status(404).json({ error: `Directory not found on local machine: ${targetDir}` });
+    }
+    const stat = await fsPromises.stat(targetDir);
+    if (!stat.isDirectory()) {
+      return res.status(400).json({ error: `Specified path is a file, not a directory: ${targetDir}` });
+    }
+
+    const files = await scanLocalDirectoryTree(targetDir, targetDir);
+    const languages = Array.from(new Set(files.map((f) => detectLanguage(f.relPath))));
+
+    res.json({
+      path: targetDir,
+      exists: true,
+      totalFiles: files.length,
+      detectedLanguages: languages,
+      previewFiles: files.slice(0, 15).map((f) => ({
+        path: f.relPath,
+        size: f.size,
+        category: determineFileCategory(f.relPath),
+      })),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: `Failed to scan directory: ${err.message}` });
+  }
+});
+
+// Local Directory Ingestion Endpoint
+app.post('/api/local/ingest', async (req, res) => {
+  const { localPath, folderName, pathFilter } = req.body;
+  const targetDir = localPath ? path.resolve(process.cwd(), localPath.trim()) : process.cwd();
+
+  try {
+    if (!fs.existsSync(targetDir)) {
+      return res.status(404).json({ error: `Directory not found on local machine: ${targetDir}` });
+    }
+
+    const allDiscovered = await scanLocalDirectoryTree(targetDir, targetDir);
+    let eligibleFiles = allDiscovered;
+
+    if (pathFilter && pathFilter.trim() !== '') {
+      const cleanFilter = pathFilter.trim().replace(/^\//, '');
+      eligibleFiles = eligibleFiles.filter((item) => item.relPath.startsWith(cleanFilter));
+    }
+
+    if (eligibleFiles.length === 0) {
+      return res.status(404).json({
+        error: `No readable code, docs, or config files found in ${targetDir} (excluding node_modules, .git, binaries).`,
+      });
+    }
+
+    // Priority sorting
+    eligibleFiles.sort((a, b) => {
+      const priority = (p: string) => {
+        const lp = p.toLowerCase();
+        if (lp === 'readme.md' || lp === 'readme') return 0;
+        if (lp.startsWith('docs/')) return 1;
+        if (lp === 'package.json' || lp === 'pyproject.toml' || lp === 'cargo.toml' || lp === 'go.mod') return 2;
+        if (lp.startsWith('src/') || lp.startsWith('lib/') || lp.startsWith('app/')) return 3;
+        if (lp.startsWith('.github/workflows')) return 4;
+        if (lp.includes('test')) return 5;
+        return 6;
+      };
+      return priority(a.relPath) - priority(b.relPath);
+    });
+
+    // Select top 35 files for dense local grounding
+    const selectedFiles = eligibleFiles.slice(0, 35);
+    const fetchedFiles: SourceFile[] = [];
+
+    for (let idx = 0; idx < selectedFiles.length; idx++) {
+      const item = selectedFiles[idx];
+      try {
+        const text = await fsPromises.readFile(item.fullPath, 'utf-8');
+        const category = determineFileCategory(item.relPath);
+        const language = detectLanguage(item.relPath);
+        const lineCount = text.split('\n').length;
+
+        fetchedFiles.push({
+          id: `local-f-${idx}-${item.relPath.replace(/[^a-zA-Z0-9]/g, '_')}`,
+          path: item.relPath,
+          language,
+          fileCategory: category,
+          size: item.size,
+          lineCount,
+          content: text,
+        });
+      } catch (err) {
+        console.warn(`Could not read local file ${item.fullPath}:`, err);
+      }
+    }
+
+    fetchedFiles.sort((a, b) => a.path.localeCompare(b.path));
+    const chunks: FileChunk[] = fetchedFiles.flatMap(createChunksFromFile);
+
+    const languagesCount: Record<string, number> = {};
+    for (const f of fetchedFiles) {
+      languagesCount[f.language] = (languagesCount[f.language] || 0) + 1;
+    }
+
+    const categoryCounts = {
+      doc: fetchedFiles.filter((f) => f.fileCategory === 'doc').length,
+      code: fetchedFiles.filter((f) => f.fileCategory === 'code').length,
+      config: fetchedFiles.filter((f) => f.fileCategory === 'config').length,
+      test: fetchedFiles.filter((f) => f.fileCategory === 'test').length,
+      workflow: fetchedFiles.filter((f) => f.fileCategory === 'workflow').length,
+    };
+
+    const resolvedName = folderName || path.basename(targetDir) || 'local-project';
+
+    const source: RepoSource = {
+      repoUrl: `file://${targetDir}`,
+      owner: 'local',
+      name: resolvedName,
+      fullName: `local/${resolvedName}`,
+      description: `Local repository located at ${targetDir}`,
+      defaultBranch: 'local',
+      selectedRef: 'local-workspace',
+      license: 'Local Repository',
+      stars: 0,
+      forks: 0,
+      openIssues: 0,
+      topics: ['local-project', 'offline-indexed'],
+      languages: languagesCount,
+      primaryLanguage: Object.keys(languagesCount)[0] || 'TypeScript',
+      avatarUrl: '',
+      lastSyncedAt: new Date().toISOString(),
+      isPrivate: true,
+      isLocal: true,
+      localPath: targetDir,
+      totalFiles: fetchedFiles.length,
+      totalLines: fetchedFiles.reduce((acc, f) => acc + f.lineCount, 0),
+      categoryCounts,
+    };
+
+    const suggestedQuestions = [
+      `What is the purpose of this local project and what are its key modules?`,
+      `Where is the primary entry point and how is the project executed locally?`,
+      `What dependencies and build scripts are declared in package / config manifests?`,
+      `How are the core components or algorithms structured in this codebase?`,
+      `What tests are configured and what quality checks exist?`,
+    ];
+
+    const notebook: Notebook = {
+      id: `nb-local-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      name: `local/${resolvedName}`,
+      repoUrl: `file://${targetDir}`,
+      ref: 'local-workspace',
+      pathFilter,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      indexStatus: 'ready',
+      source,
+      files: fetchedFiles,
+      chunks,
+      messages: [
+        {
+          id: `msg-${Date.now()}`,
+          role: 'assistant',
+          content: `📁 Local project **${resolvedName}** (\`${targetDir}\`) has been successfully ingested and indexed!
+
+- **Files Indexed**: ${fetchedFiles.length} (${chunks.length} semantic chunks)
+- **Local Path**: \`${targetDir}\`
+- **Categories**: ${categoryCounts.doc} Docs, ${categoryCounts.code} Code files, ${categoryCounts.config} Configs, ${categoryCounts.test} Tests, ${categoryCounts.workflow} Workflows
+- **Persistence**: Saved automatically to local disk (\`.reponotebook_data/notebooks.json\`) and IndexedDB.
+
+*Every answer is strictly grounded in this local codebase with exact file and line citations.*`,
+          citations: fetchedFiles.length > 0 ? [
+            {
+              id: 'c-local-intro',
+              filePath: fetchedFiles[0].path,
+              startLine: 1,
+              endLine: Math.min(25, fetchedFiles[0].lineCount),
+              snippet: fetchedFiles[0].content.slice(0, 250),
+              fileCategory: fetchedFiles[0].fileCategory,
+            }
+          ] : [],
+          suggestedFollowUps: suggestedQuestions.slice(0, 3),
+          createdAt: new Date().toISOString(),
+          confidence: 'grounded',
+        }
+      ],
+      notes: [],
+      artifacts: [],
+      pinnedCitations: [],
+      suggestedQuestions,
+    };
+
+    // Automatically persist to local disk
+    const currentNotebooks = await readStoredNotebooks();
+    const updatedNotebooks = [notebook, ...currentNotebooks.filter((n) => n.id !== notebook.id)];
+    await writeStoredNotebooks(updatedNotebooks);
+
+    return res.json({
+      notebook,
+      source,
+      files: fetchedFiles,
+      chunks,
+      suggestedQuestions,
+    });
+  } catch (err: any) {
+    console.error('Local ingest error:', err);
+    return res.status(500).json({ error: `Local ingestion failed: ${err.message}` });
+  }
+});
+
+// Upload Folder Ingestion (Drag-and-Drop or Browser Folder Picker)
+app.post('/api/local/upload-folder', async (req, res) => {
+  const { folderName = 'uploaded-repo', uploadedFiles = [] } = req.body;
+
+  if (!Array.isArray(uploadedFiles) || uploadedFiles.length === 0) {
+    return res.status(400).json({ error: 'No files uploaded' });
+  }
+
+  try {
+    const fetchedFiles: SourceFile[] = [];
+
+    for (let idx = 0; idx < uploadedFiles.length; idx++) {
+      const file = uploadedFiles[idx];
+      if (!file.path || typeof file.content !== 'string') continue;
+      const cleanPath = file.path.replace(/\\/g, '/').replace(/^\//, '');
+
+      // Skip ignored
+      const lower = cleanPath.toLowerCase();
+      if (
+        lower.includes('node_modules/') ||
+        lower.includes('.git/') ||
+        lower.includes('.next/') ||
+        lower.includes('dist/') ||
+        lower.includes('build/') ||
+        lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.ico') ||
+        lower.endsWith('.lock')
+      ) {
+        continue;
+      }
+
+      const category = determineFileCategory(cleanPath);
+      const language = detectLanguage(cleanPath);
+      const lineCount = file.content.split('\n').length;
+
+      fetchedFiles.push({
+        id: `upload-f-${idx}-${cleanPath.replace(/[^a-zA-Z0-9]/g, '_')}`,
+        path: cleanPath,
+        language,
+        fileCategory: category,
+        size: file.content.length,
+        lineCount,
+        content: file.content,
+      });
+    }
+
+    if (fetchedFiles.length === 0) {
+      return res.status(400).json({ error: 'No readable text files found in the uploaded directory' });
+    }
+
+    fetchedFiles.sort((a, b) => a.path.localeCompare(b.path));
+    const chunks: FileChunk[] = fetchedFiles.flatMap(createChunksFromFile);
+
+    const languagesCount: Record<string, number> = {};
+    for (const f of fetchedFiles) {
+      languagesCount[f.language] = (languagesCount[f.language] || 0) + 1;
+    }
+
+    const categoryCounts = {
+      doc: fetchedFiles.filter((f) => f.fileCategory === 'doc').length,
+      code: fetchedFiles.filter((f) => f.fileCategory === 'code').length,
+      config: fetchedFiles.filter((f) => f.fileCategory === 'config').length,
+      test: fetchedFiles.filter((f) => f.fileCategory === 'test').length,
+      workflow: fetchedFiles.filter((f) => f.fileCategory === 'workflow').length,
+    };
+
+    const source: RepoSource = {
+      repoUrl: `local://${folderName}`,
+      owner: 'local',
+      name: folderName,
+      fullName: `local/${folderName}`,
+      description: `Uploaded local repository folder (${fetchedFiles.length} files)`,
+      defaultBranch: 'local',
+      selectedRef: 'local-upload',
+      license: 'Local Folder',
+      stars: 0,
+      forks: 0,
+      openIssues: 0,
+      topics: ['uploaded-local-repo'],
+      languages: languagesCount,
+      primaryLanguage: Object.keys(languagesCount)[0] || 'Code',
+      avatarUrl: '',
+      lastSyncedAt: new Date().toISOString(),
+      isPrivate: true,
+      isLocal: true,
+      totalFiles: fetchedFiles.length,
+      totalLines: fetchedFiles.reduce((acc, f) => acc + f.lineCount, 0),
+      categoryCounts,
+    };
+
+    const suggestedQuestions = [
+      `What are the core modules and entry points in this uploaded project?`,
+      `How is this codebase organized and what patterns does it use?`,
+      `What dependencies, configurations, and scripts are defined here?`,
+    ];
+
+    const notebook: Notebook = {
+      id: `nb-upload-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      name: `local/${folderName}`,
+      repoUrl: `local://${folderName}`,
+      ref: 'local-upload',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      indexStatus: 'ready',
+      source,
+      files: fetchedFiles,
+      chunks,
+      messages: [
+        {
+          id: `msg-${Date.now()}`,
+          role: 'assistant',
+          content: `📦 Uploaded folder **${folderName}** has been indexed into a persistent local notebook!
+
+- **Files Indexed**: ${fetchedFiles.length} (${chunks.length} chunks)
+- **Primary Language**: ${source.primaryLanguage}
+- **Stored In**: Local Disk & IndexedDB.
+
+*You can now ask questions, generate mindmaps, slide decks, and architecture summaries grounded in this folder.*`,
+          citations: [
+            {
+              id: 'c-upload-intro',
+              filePath: fetchedFiles[0].path,
+              startLine: 1,
+              endLine: Math.min(20, fetchedFiles[0].lineCount),
+              snippet: fetchedFiles[0].content.slice(0, 200),
+              fileCategory: fetchedFiles[0].fileCategory,
+            }
+          ],
+          suggestedFollowUps: suggestedQuestions.slice(0, 3),
+          createdAt: new Date().toISOString(),
+          confidence: 'grounded',
+        }
+      ],
+      notes: [],
+      artifacts: [],
+      pinnedCitations: [],
+      suggestedQuestions,
+    };
+
+    // Persist to local disk
+    const currentNotebooks = await readStoredNotebooks();
+    const updatedNotebooks = [notebook, ...currentNotebooks.filter((n) => n.id !== notebook.id)];
+    await writeStoredNotebooks(updatedNotebooks);
+
+    return res.json({
+      notebook,
+      source,
+      files: fetchedFiles,
+      chunks,
+      suggestedQuestions,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: `Upload processing failed: ${err.message}` });
+  }
+});
 
 // Ingest repository endpoint
 app.post('/api/repo/ingest', async (req, res) => {
