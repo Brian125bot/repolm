@@ -1,0 +1,142 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // 1. UserProfile Validation
+    function isValidUserProfile(data) {
+      return data.userId is string && data.userId == request.auth.uid &&
+             data.email is string && data.email.size() <= 256 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+             data.createdAt is string && data.createdAt.size() <= 64 &&
+             data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isOwner(userId) && isValidUserProfile(incoming());
+      allow update: if isOwner(userId) && isValidUserProfile(incoming()) && incoming().userId == existing().userId;
+      allow delete: if isOwner(userId);
+    }
+
+    // 2. Notebook Validation
+    function isValidNotebook(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.ownerId is string && data.ownerId == request.auth.uid &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 256 &&
+             data.repoUrl is string && data.repoUrl.size() <= 512 &&
+             data.ref is string && data.ref.size() <= 128 &&
+             (!('pathFilter' in data) || (data.pathFilter is string && data.pathFilter.size() <= 256)) &&
+             data.createdAt is string && data.createdAt.size() <= 64 &&
+             data.updatedAt is string && data.updatedAt.size() <= 64 &&
+             data.indexStatus is string && data.indexStatus in ['idle', 'fetching', 'indexing', 'ready', 'error'] &&
+             (!('suggestedQuestions' in data) || (data.suggestedQuestions is list && data.suggestedQuestions.size() <= 50)) &&
+             (!('pinnedCitations' in data) || (data.pinnedCitations is list && data.pinnedCitations.size() <= 100));
+    }
+
+    match /notebooks/{notebookId} {
+      allow get: if isSignedIn() && isValidId(notebookId) && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(notebookId) && isValidNotebook(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(notebookId) && isValidNotebook(incoming()) && incoming().ownerId == existing().ownerId;
+      allow delete: if isSignedIn() && isValidId(notebookId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // 3. Note Validation
+    function isValidNote(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.ownerId is string && data.ownerId == request.auth.uid &&
+             data.notebookId is string && data.notebookId.size() <= 128 &&
+             data.title is string && data.title.size() <= 256 &&
+             data.content is string && data.content.size() <= 65536 &&
+             (!('tags' in data) || (data.tags is list && data.tags.size() <= 50)) &&
+             (!('citations' in data) || (data.citations is list && data.citations.size() <= 100)) &&
+             (!('sourceMessageId' in data) || (data.sourceMessageId is string && data.sourceMessageId.size() <= 128)) &&
+             data.createdAt is string && data.createdAt.size() <= 64 &&
+             data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /notes/{noteId} {
+      allow get: if isSignedIn() && isValidId(noteId) && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(noteId) && isValidNote(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(noteId) && isValidNote(incoming()) && incoming().ownerId == existing().ownerId;
+      allow delete: if isSignedIn() && isValidId(noteId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // 4. Artifact Validation
+    function isValidArtifact(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.ownerId is string && data.ownerId == request.auth.uid &&
+             data.notebookId is string && data.notebookId.size() <= 128 &&
+             data.type is string && data.type.size() <= 64 &&
+             data.title is string && data.title.size() <= 256 &&
+             data.content is string && data.content.size() <= 131072 &&
+             (!('citations' in data) || (data.citations is list && data.citations.size() <= 100)) &&
+             data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /artifacts/{artifactId} {
+      allow get: if isSignedIn() && isValidId(artifactId) && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(artifactId) && isValidArtifact(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(artifactId) && isValidArtifact(incoming()) && incoming().ownerId == existing().ownerId;
+      allow delete: if isSignedIn() && isValidId(artifactId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // 5. ChatMessage Validation
+    function isValidChatMessage(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.ownerId is string && data.ownerId == request.auth.uid &&
+             data.notebookId is string && data.notebookId.size() <= 128 &&
+             data.role is string && data.role in ['user', 'assistant', 'system'] &&
+             data.content is string && data.content.size() <= 65536 &&
+             (!('citations' in data) || (data.citations is list && data.citations.size() <= 100)) &&
+             (!('suggestedFollowUps' in data) || (data.suggestedFollowUps is list && data.suggestedFollowUps.size() <= 20)) &&
+             (!('answerMode' in data) || (data.answerMode is string && data.answerMode.size() <= 32)) &&
+             (!('modelUsed' in data) || (data.modelUsed is string && data.modelUsed.size() <= 64)) &&
+             (!('confidence' in data) || (data.confidence is string && data.confidence.size() <= 32)) &&
+             data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    match /chatMessages/{messageId} {
+      allow get: if isSignedIn() && isValidId(messageId) && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(messageId) && isValidChatMessage(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(messageId) && isValidChatMessage(incoming()) && incoming().ownerId == existing().ownerId;
+      allow delete: if isSignedIn() && isValidId(messageId) && resource.data.ownerId == request.auth.uid;
+    }
+
+    // Connection testing endpoint for health check
+    match /test/{docId} {
+      allow read: if true;
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "RepoNotebook - Single Repo Research Notebook",
-  "description": "NotebookLM-style workspace strictly grounded in a single GitHub repository for citation-backed Q&A, code analysis, artifact generation, and note-taking.",
+  "description": "NotebookLM-style workspace strictly grounded in a single GitHub repository with Firebase user accounts, cloud-persisted notes, artifacts, and citation-backed Q&A.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

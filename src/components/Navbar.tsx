@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Notebook } from '../types';
+import { useAuth } from '../context/AuthContext';
 import {
   BookOpen,
   Plus,
@@ -11,6 +12,9 @@ import {
   FileText,
   Copy,
   Check,
+  Cloud,
+  LogOut,
+  User as UserIcon,
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -21,6 +25,7 @@ interface NavbarProps {
   onOpenSettings: () => void;
   onOpenDocs?: () => void;
   hasCustomToken: boolean;
+  isSyncing?: boolean;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -31,9 +36,12 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenSettings,
   onOpenDocs,
   hasCustomToken,
+  isSyncing,
 }) => {
+  const { user, profile, signOut } = useAuth();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const handleExportJSON = () => {
@@ -129,8 +137,11 @@ export const Navbar: React.FC<NavbarProps> = ({
               className="absolute left-0 top-full mt-1.5 w-72 bg-[#161B22] border border-[#30363D] rounded-lg shadow-2xl py-1 z-50 text-xs animate-in fade-in"
               onClick={() => setDropdownOpen(false)}
             >
-              <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-[#8B949E] border-b border-[#30363D]">
-                Single-Repo Notebooks ({notebooks.length})
+              <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-[#8B949E] border-b border-[#30363D] flex items-center justify-between">
+                <span>My Cloud Notebooks ({notebooks.length})</span>
+                <span className="text-[9px] text-[#3FB950] flex items-center gap-1">
+                  <Cloud className="w-2.5 h-2.5" /> Firestore Synced
+                </span>
               </div>
               <div className="max-h-60 overflow-y-auto py-1">
                 {notebooks.map((nb) => (
@@ -180,6 +191,12 @@ export const Navbar: React.FC<NavbarProps> = ({
             <span className="font-mono text-[#F0F6FC]">{activeNotebook.source.name}</span>
           </div>
         )}
+
+        {/* Cloud Sync Status */}
+        <div className="hidden xl:flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-medium text-[#8B949E]">
+          <Cloud className={`w-3 h-3 ${isSyncing ? 'text-amber-400 animate-pulse' : 'text-[#3FB950]'}`} />
+          <span>{isSyncing ? 'Syncing...' : 'Cloud Synced'}</span>
+        </div>
       </div>
 
       {/* Action Buttons */}
@@ -262,7 +279,62 @@ export const Navbar: React.FC<NavbarProps> = ({
           <Key className="w-3.5 h-3.5" />
           <span className="hidden md:inline">{hasCustomToken ? 'Token Active' : 'GitHub Token'}</span>
         </button>
+
+        {/* User Account & Profile Menu */}
+        {user && (
+          <div className="relative ml-1">
+            <button
+              id="nav-user-profile-btn"
+              onClick={() => setUserMenuOpen(!userMenuOpen)}
+              className="flex items-center gap-1.5 p-1 rounded-full border border-[#30363D] bg-[#21262D] hover:bg-[#30363D] transition cursor-pointer"
+              title={`Logged in as ${user.email}`}
+            >
+              {user.photoURL ? (
+                <img
+                  src={user.photoURL}
+                  alt={user.displayName || 'User'}
+                  className="w-6 h-6 rounded-full object-cover"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <div className="w-6 h-6 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[11px] font-bold">
+                  {user.email ? user.email.charAt(0).toUpperCase() : 'U'}
+                </div>
+              )}
+            </button>
+
+            {userMenuOpen && (
+              <div
+                className="absolute right-0 top-full mt-1.5 w-64 bg-[#161B22] border border-[#30363D] rounded-xl shadow-2xl py-2 z-50 text-xs animate-in fade-in"
+                onClick={() => setUserMenuOpen(false)}
+              >
+                <div className="px-3 py-2 border-b border-[#30363D]">
+                  <div className="font-semibold text-[#F0F6FC] truncate">
+                    {profile?.displayName || user.displayName || 'Researcher'}
+                  </div>
+                  <div className="text-[11px] text-[#8B949E] truncate">{user.email}</div>
+                  <div className="mt-2 flex items-center gap-1.5 text-[10px] text-[#3FB950] font-medium bg-[#238636]/10 px-2 py-0.5 rounded border border-[#238636]/30">
+                    <Cloud className="w-3 h-3" />
+                    <span>Firestore Cloud Sync Active</span>
+                  </div>
+                </div>
+
+                <div className="py-1">
+                  <button
+                    id="signout-button"
+                    onClick={() => signOut()}
+                    className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-rose-500/10 text-rose-300 transition cursor-pointer"
+                  >
+                    <LogOut className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Sign Out</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );
 };
+
