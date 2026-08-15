@@ -6,52 +6,26 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import { FileChunk, SourceFile, RepoSource, Citation, AnswerMode, ArtifactType, Notebook } from './src/types';
-import { createChunksFromFile, getSampleZustandNotebook } from './src/sampleRepos';
+import { getSampleZustandNotebook } from './src/sampleRepos';
+import {
+  getDatabase,
+  getAllNotebooks,
+  saveNotebook,
+  saveNotebooks,
+  deleteNotebook,
+  getStorageDiagnostics,
+} from './server/db';
+import { validateLocalPath } from './server/security';
+import {
+  chunkFileContent,
+  buildGroundedPromptContext,
+  generateRepositoryOutline,
+} from './server/indexer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Local Disk Persistence Storage Setup
-const DATA_DIR = path.join(process.cwd(), '.reponotebook_data');
-const DATA_FILE = path.join(DATA_DIR, 'notebooks.json');
-
-async function ensureStorageDir(): Promise<void> {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      await fsPromises.mkdir(DATA_DIR, { recursive: true });
-    }
-    if (!fs.existsSync(DATA_FILE)) {
-      const demo = getSampleZustandNotebook();
-      await fsPromises.writeFile(DATA_FILE, JSON.stringify([demo], null, 2), 'utf-8');
-    }
-  } catch (err) {
-    console.warn('[Storage] ensureStorageDir notice:', err);
-  }
-}
-
-async function readStoredNotebooks(): Promise<Notebook[]> {
-  await ensureStorageDir();
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = await fsPromises.readFile(DATA_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
-      }
-    }
-  } catch (err) {
-    console.warn('[Storage] Failed to read stored notebooks:', err);
-  }
-  const demo = getSampleZustandNotebook();
-  return [demo];
-}
-
-async function writeStoredNotebooks(notebooks: Notebook[]): Promise<void> {
-  await ensureStorageDir();
-  await fsPromises.writeFile(DATA_FILE, JSON.stringify(notebooks, null, 2), 'utf-8');
-}
-
-// Initialize Gemini SDK with User-Agent header
+// Initialize Gemini SDK
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
   httpOptions: {
@@ -66,60 +40,44 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '50mb' }));
 
-// Healthcheck
-app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    mode: 'local-optimized',
-    storage: 'disk-persistent',
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// Storage Endpoints
-app.get('/api/storage/status', async (_req, res) => {
+// 1. Healthcheck
+app.get('/api/health', async (_req, res) => {
   try {
-    await ensureStorageDir();
-    const notebooks = await readStoredNotebooks();
-    let size = 0;
-    let mtime = new Date();
-    try {
-      const stat = await fsPromises.stat(DATA_FILE);
-      size = stat.size;
-      mtime = stat.mtime;
-    } catch {
-      size = JSON.stringify(notebooks).length;
-    }
-
-    const totalFiles = notebooks.reduce((acc, n) => acc + (n.files?.length || 0), 0);
-    const totalChunks = notebooks.reduce((acc, n) => acc + (n.chunks?.length || 0), 0);
-    const totalMessages = notebooks.reduce((acc, n) => acc + (n.messages?.length || 0), 0);
-    const totalNotes = notebooks.reduce((acc, n) => acc + (n.notes?.length || 0), 0);
-    const totalArtifacts = notebooks.reduce((acc, n) => acc + (n.artifacts?.length || 0), 0);
-
+    const stats = await getStorageDiagnostics();
     res.json({
-      totalNotebooks: notebooks.length,
-      totalFiles,
-      totalChunks,
-      totalMessages,
-      totalNotes,
-      totalArtifacts,
-      diskUsageBytes: size,
-      storagePath: '.reponotebook_data/notebooks.json',
-      isDiskAvailable: true,
-      lastSavedAt: mtime instanceof Date ? mtime.toISOString() : new Date().toISOString(),
+      status: 'ok',
+      mode: 'local-optimized',
+      storage: 'sqlite-concurrency-safe',
+      database: stats.storagePath,
+      totalNotebooks: stats.totalNotebooks,
+      timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to read storage status' });
+    res.json({
+      status: 'ok',
+      mode: 'local-optimized',
+      storage: 'sqlite',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// 2. Storage Endpoints (Concurrency-Safe SQLite)
+app.get('/api/storage/status', async (_req, res) => {
+  try {
+    const stats = await getStorageDiagnostics();
+    res.json(stats);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to read storage diagnostics' });
   }
 });
 
 app.get('/api/storage/notebooks', async (_req, res) => {
   try {
-    const notebooks = await readStoredNotebooks();
+    const notebooks = await getAllNotebooks();
     res.json({ notebooks });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch notebooks' });
+    res.status(500).json({ error: err.message || 'Failed to fetch notebooks from SQLite' });
   }
 });
 
@@ -129,22 +87,20 @@ app.post('/api/storage/notebooks', async (req, res) => {
     return res.status(400).json({ error: 'Expected an array of notebooks' });
   }
   try {
-    await writeStoredNotebooks(notebooks);
+    await saveNotebooks(notebooks);
     res.json({ success: true, count: notebooks.length });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to write notebooks to disk' });
+    res.status(500).json({ error: err.message || 'Failed to write notebooks to SQLite' });
   }
 });
 
 app.delete('/api/storage/notebooks/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const notebooks = await readStoredNotebooks();
-    const filtered = notebooks.filter((n) => n.id !== id);
-    await writeStoredNotebooks(filtered);
-    res.json({ success: true, remaining: filtered.length });
+    const success = await deleteNotebook(id);
+    res.json({ success });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete notebook' });
+    res.status(500).json({ error: err.message || 'Failed to delete notebook from SQLite' });
   }
 });
 
@@ -257,7 +213,7 @@ function parseGitHubUrl(rawUrl: string): { owner: string; repo: string } | null 
   return null;
 }
 
-// Local Directory Recursive Scanner
+// Local Directory Recursive Scanner with security filters
 const IGNORED_LOCAL_DIRS = new Set([
   'node_modules',
   '.git',
@@ -298,12 +254,14 @@ const BINARY_EXTENSIONS = new Set([
   '.bin',
   '.lock',
   '.map',
+  '.min.js',
+  '.min.css',
 ]);
 
 async function scanLocalDirectoryTree(
   dirPath: string,
   basePath: string = dirPath,
-  maxDepth: number = 7,
+  maxDepth: number = 12,
   currentDepth: number = 0
 ): Promise<Array<{ fullPath: string; relPath: string; size: number }>> {
   if (currentDepth > maxDepth) return [];
@@ -329,14 +287,17 @@ async function scanLocalDirectoryTree(
           BINARY_EXTENSIONS.has(ext) ||
           entry.name === 'package-lock.json' ||
           entry.name === 'yarn.lock' ||
-          entry.name === 'pnpm-lock.yaml'
+          entry.name === 'pnpm-lock.yaml' ||
+          entry.name.endsWith('.min.js') ||
+          entry.name.endsWith('.min.css')
         ) {
           continue;
         }
 
         try {
           const stat = await fsPromises.stat(full);
-          if (stat.size <= 250000) {
+          // Allow files up to 500KB
+          if (stat.size <= 500000) {
             results.push({ fullPath: full, relPath: rel, size: stat.size });
           }
         } catch {
@@ -350,10 +311,17 @@ async function scanLocalDirectoryTree(
   }
 }
 
-// Local Scan Preview Endpoint
+// 3. Local Scan Preview Endpoint with Sandbox Path Validation
 app.post('/api/local/scan', async (req, res) => {
   const { localPath } = req.body;
-  const targetDir = localPath ? path.resolve(process.cwd(), localPath.trim()) : process.cwd();
+
+  // Security Sandbox Validation
+  const validation = validateLocalPath(localPath);
+  if (!validation.isValid || !validation.resolvedPath) {
+    return res.status(403).json({ error: validation.error || 'Access to this local path is restricted.' });
+  }
+
+  const targetDir = validation.resolvedPath;
 
   try {
     if (!fs.existsSync(targetDir)) {
@@ -372,7 +340,7 @@ app.post('/api/local/scan', async (req, res) => {
       exists: true,
       totalFiles: files.length,
       detectedLanguages: languages,
-      previewFiles: files.slice(0, 15).map((f) => ({
+      previewFiles: files.slice(0, 30).map((f) => ({
         path: f.relPath,
         size: f.size,
         category: determineFileCategory(f.relPath),
@@ -383,10 +351,17 @@ app.post('/api/local/scan', async (req, res) => {
   }
 });
 
-// Local Directory Ingestion Endpoint
+// 4. Local Directory Ingestion Endpoint (Supports Hundreds of Files with Syntactic Chunking)
 app.post('/api/local/ingest', async (req, res) => {
   const { localPath, folderName, pathFilter } = req.body;
-  const targetDir = localPath ? path.resolve(process.cwd(), localPath.trim()) : process.cwd();
+
+  // Security Sandbox Validation
+  const validation = validateLocalPath(localPath);
+  if (!validation.isValid || !validation.resolvedPath) {
+    return res.status(403).json({ error: validation.error || 'Access to this local path is restricted.' });
+  }
+
+  const targetDir = validation.resolvedPath;
 
   try {
     if (!fs.existsSync(targetDir)) {
@@ -407,23 +382,8 @@ app.post('/api/local/ingest', async (req, res) => {
       });
     }
 
-    // Priority sorting
-    eligibleFiles.sort((a, b) => {
-      const priority = (p: string) => {
-        const lp = p.toLowerCase();
-        if (lp === 'readme.md' || lp === 'readme') return 0;
-        if (lp.startsWith('docs/')) return 1;
-        if (lp === 'package.json' || lp === 'pyproject.toml' || lp === 'cargo.toml' || lp === 'go.mod') return 2;
-        if (lp.startsWith('src/') || lp.startsWith('lib/') || lp.startsWith('app/')) return 3;
-        if (lp.startsWith('.github/workflows')) return 4;
-        if (lp.includes('test')) return 5;
-        return 6;
-      };
-      return priority(a.relPath) - priority(b.relPath);
-    });
-
-    // Select top 35 files for dense local grounding
-    const selectedFiles = eligibleFiles.slice(0, 35);
+    // Ingest hundreds of files cleanly (up to 500 files per workspace)
+    const selectedFiles = eligibleFiles.slice(0, 500);
     const fetchedFiles: SourceFile[] = [];
 
     for (let idx = 0; idx < selectedFiles.length; idx++) {
@@ -449,7 +409,9 @@ app.post('/api/local/ingest', async (req, res) => {
     }
 
     fetchedFiles.sort((a, b) => a.path.localeCompare(b.path));
-    const chunks: FileChunk[] = fetchedFiles.flatMap(createChunksFromFile);
+    
+    // Chunk all files with syntactic & semantic boundaries
+    const chunks: FileChunk[] = fetchedFiles.flatMap(chunkFileContent);
 
     const languagesCount: Record<string, number> = {};
     for (const f of fetchedFiles) {
@@ -471,14 +433,14 @@ app.post('/api/local/ingest', async (req, res) => {
       owner: 'local',
       name: resolvedName,
       fullName: `local/${resolvedName}`,
-      description: `Local repository located at ${targetDir}`,
+      description: `Local repository located at ${targetDir} (${fetchedFiles.length} files indexed)`,
       defaultBranch: 'local',
       selectedRef: 'local-workspace',
       license: 'Local Repository',
       stars: 0,
       forks: 0,
       openIssues: 0,
-      topics: ['local-project', 'offline-indexed'],
+      topics: ['local-project', 'indexed-workspace'],
       languages: languagesCount,
       primaryLanguage: Object.keys(languagesCount)[0] || 'TypeScript',
       avatarUrl: '',
@@ -517,12 +479,12 @@ app.post('/api/local/ingest', async (req, res) => {
           role: 'assistant',
           content: `📁 Local project **${resolvedName}** (\`${targetDir}\`) has been successfully ingested and indexed!
 
-- **Files Indexed**: ${fetchedFiles.length} (${chunks.length} semantic chunks)
+- **Files Indexed**: ${fetchedFiles.length} (${chunks.length} syntactic chunks indexed)
 - **Local Path**: \`${targetDir}\`
-- **Categories**: ${categoryCounts.doc} Docs, ${categoryCounts.code} Code files, ${categoryCounts.config} Configs, ${categoryCounts.test} Tests, ${categoryCounts.workflow} Workflows
-- **Persistence**: Saved automatically to local disk (\`.reponotebook_data/notebooks.json\`) and IndexedDB.
+- **Breakdown**: ${categoryCounts.doc} Docs, ${categoryCounts.code} Code files, ${categoryCounts.config} Configs, ${categoryCounts.test} Tests, ${categoryCounts.workflow} Workflows
+- **Persistence**: Saved transactionally to SQLite database (\`.reponotebook_data/reponotebook.sqlite\`) and IndexedDB.
 
-*Every answer is strictly grounded in this local codebase with exact file and line citations.*`,
+*Every answer is grounded using BM25 inverted index retrieval with exact file and line citations.*`,
           citations: fetchedFiles.length > 0 ? [
             {
               id: 'c-local-intro',
@@ -544,10 +506,8 @@ app.post('/api/local/ingest', async (req, res) => {
       suggestedQuestions,
     };
 
-    // Automatically persist to local disk
-    const currentNotebooks = await readStoredNotebooks();
-    const updatedNotebooks = [notebook, ...currentNotebooks.filter((n) => n.id !== notebook.id)];
-    await writeStoredNotebooks(updatedNotebooks);
+    // Save transactionally to SQLite
+    await saveNotebook(notebook);
 
     return res.json({
       notebook,
@@ -562,7 +522,7 @@ app.post('/api/local/ingest', async (req, res) => {
   }
 });
 
-// Upload Folder Ingestion (Drag-and-Drop or Browser Folder Picker)
+// 5. Upload Folder Ingestion (Drag-and-Drop or Browser Folder Picker)
 app.post('/api/local/upload-folder', async (req, res) => {
   const { folderName = 'uploaded-repo', uploadedFiles = [] } = req.body;
 
@@ -589,7 +549,9 @@ app.post('/api/local/upload-folder', async (req, res) => {
         lower.endsWith('.png') ||
         lower.endsWith('.jpg') ||
         lower.endsWith('.ico') ||
-        lower.endsWith('.lock')
+        lower.endsWith('.lock') ||
+        lower.endsWith('.min.js') ||
+        lower.endsWith('.min.css')
       ) {
         continue;
       }
@@ -614,7 +576,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
     }
 
     fetchedFiles.sort((a, b) => a.path.localeCompare(b.path));
-    const chunks: FileChunk[] = fetchedFiles.flatMap(createChunksFromFile);
+    const chunks: FileChunk[] = fetchedFiles.flatMap(chunkFileContent);
 
     const languagesCount: Record<string, number> = {};
     for (const f of fetchedFiles) {
@@ -634,7 +596,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
       owner: 'local',
       name: folderName,
       fullName: `local/${folderName}`,
-      description: `Uploaded local repository folder (${fetchedFiles.length} files)`,
+      description: `Uploaded local repository folder (${fetchedFiles.length} files indexed)`,
       defaultBranch: 'local',
       selectedRef: 'local-upload',
       license: 'Local Folder',
@@ -676,9 +638,9 @@ app.post('/api/local/upload-folder', async (req, res) => {
           role: 'assistant',
           content: `📦 Uploaded folder **${folderName}** has been indexed into a persistent local notebook!
 
-- **Files Indexed**: ${fetchedFiles.length} (${chunks.length} chunks)
+- **Files Indexed**: ${fetchedFiles.length} (${chunks.length} chunks indexed)
 - **Primary Language**: ${source.primaryLanguage}
-- **Stored In**: Local Disk & IndexedDB.
+- **Stored In**: Concurrency-Safe SQLite Database & IndexedDB.
 
 *You can now ask questions, generate mindmaps, slide decks, and architecture summaries grounded in this folder.*`,
           citations: [
@@ -702,10 +664,8 @@ app.post('/api/local/upload-folder', async (req, res) => {
       suggestedQuestions,
     };
 
-    // Persist to local disk
-    const currentNotebooks = await readStoredNotebooks();
-    const updatedNotebooks = [notebook, ...currentNotebooks.filter((n) => n.id !== notebook.id)];
-    await writeStoredNotebooks(updatedNotebooks);
+    // Save to SQLite
+    await saveNotebook(notebook);
 
     return res.json({
       notebook,
@@ -719,7 +679,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
   }
 });
 
-// Ingest repository endpoint
+// 6. Ingest repository endpoint (Supports Hundreds of Files with Syntactic Chunking)
 app.post('/api/repo/ingest', async (req, res) => {
   const { repoUrl, ref, githubToken, pathFilter } = req.body;
 
@@ -735,9 +695,10 @@ app.post('/api/repo/ingest', async (req, res) => {
   const { owner, repo } = parsed;
   const fullName = `${owner}/${repo}`;
 
-  // If zustand demo requested or offline match
+  // Demo shortcut
   if (fullName.toLowerCase() === 'pmndrs/zustand' && !githubToken) {
     const demo = getSampleZustandNotebook();
+    await saveNotebook(demo);
     return res.json({
       source: demo.source,
       files: demo.files,
@@ -761,13 +722,13 @@ app.post('/api/repo/ingest', async (req, res) => {
     
     if (!repoMetaRes.ok) {
       if (repoMetaRes.status === 403 || repoMetaRes.status === 429) {
-        // Rate limit hit -> provide structured fallback or prompt for token
         console.warn(`GitHub API Rate limit for ${fullName}. Falling back to sample indexed repo.`);
         const demo = getSampleZustandNotebook();
         demo.source.fullName = fullName;
         demo.source.name = repo;
         demo.source.owner = owner;
         demo.source.repoUrl = `https://github.com/${fullName}`;
+        await saveNotebook(demo);
         return res.json({
           source: demo.source,
           files: demo.files,
@@ -835,6 +796,9 @@ app.post('/api/repo/ingest', async (req, res) => {
       '.git/',
       '.idea/',
       '.vscode/',
+      '.min.js',
+      '.min.css',
+      '.map',
     ];
 
     let eligibleFiles = treeItems.filter((item) => {
@@ -847,19 +811,14 @@ app.post('/api/repo/ingest', async (req, res) => {
       eligibleFiles = eligibleFiles.filter((item) => item.path.startsWith(cleanFilter));
     }
 
-    // Prioritize high-value files:
-    // 1. README & main docs
-    // 2. package.json, Cargo.toml, pyproject.toml, go.mod
-    // 3. Main source files (src/, lib/, index.*, app.*)
-    // 4. Workflows & configs
-    // 5. Tests
+    // Prioritize high-value files
     eligibleFiles.sort((a, b) => {
       const priority = (p: string) => {
         const lp = p.toLowerCase();
         if (lp === 'readme.md' || lp === 'readme') return 0;
         if (lp.startsWith('docs/')) return 1;
         if (lp === 'package.json' || lp === 'pyproject.toml' || lp === 'cargo.toml' || lp === 'go.mod') return 2;
-        if (lp.startsWith('src/') || lp.startsWith('lib/')) return 3;
+        if (lp.startsWith('src/') || lp.startsWith('lib/') || lp.startsWith('app/')) return 3;
         if (lp.startsWith('.github/workflows')) return 4;
         if (lp.includes('test')) return 5;
         return 6;
@@ -867,56 +826,54 @@ app.post('/api/repo/ingest', async (req, res) => {
       return priority(a.path) - priority(b.path);
     });
 
-    // Limit to top 25 files for fast, dense grounding
-    const selectedFiles = eligibleFiles.slice(0, 25);
-
-    // 4. Fetch content for each selected file
+    // Ingest up to 250 files per repository in parallel batches
+    const selectedFiles = eligibleFiles.slice(0, 250);
     const fetchedFiles: SourceFile[] = [];
 
-    await Promise.all(
-      selectedFiles.map(async (item, idx) => {
-        try {
-          const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${targetRef}/${item.path}`;
-          const contentRes = await fetch(rawUrl, { headers });
-          if (contentRes.ok) {
-            const text = await contentRes.text();
-            // Skip massive files (> 200KB)
-            if (text.length > 200000) return;
+    // Parallel fetch with concurrency limit of 15
+    const batchSize = 15;
+    for (let i = 0; i < selectedFiles.length; i += batchSize) {
+      const batch = selectedFiles.slice(i, i + batchSize);
+      await Promise.all(
+        batch.map(async (item, idx) => {
+          try {
+            const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${targetRef}/${item.path}`;
+            const contentRes = await fetch(rawUrl, { headers });
+            if (contentRes.ok) {
+              const text = await contentRes.text();
+              // Skip files larger than 300KB
+              if (text.length > 300000) return;
 
-            const category = determineFileCategory(item.path);
-            const language = detectLanguage(item.path);
-            const lineCount = text.split('\n').length;
+              const category = determineFileCategory(item.path);
+              const language = detectLanguage(item.path);
+              const lineCount = text.split('\n').length;
 
-            fetchedFiles.push({
-              id: `f-${idx}-${item.path.replace(/[^a-zA-Z0-9]/g, '_')}`,
-              path: item.path,
-              language,
-              fileCategory: category,
-              size: item.size || text.length,
-              lineCount,
-              content: text,
-            });
+              fetchedFiles.push({
+                id: `f-${i + idx}-${item.path.replace(/[^a-zA-Z0-9]/g, '_')}`,
+                path: item.path,
+                language,
+                fileCategory: category,
+                size: item.size || text.length,
+                lineCount,
+                content: text,
+              });
+            }
+          } catch (err) {
+            console.warn(`Failed to fetch file ${item.path}`, err);
           }
-        } catch (err) {
-          console.warn(`Failed to fetch file ${item.path}`, err);
-        }
-      })
-    );
+        })
+      );
+    }
 
-    // If fetch failed to get any files (e.g. private repo without token), throw clear error
     if (fetchedFiles.length === 0) {
       return res.status(404).json({
-        error: `Could not retrieve file contents from ${fullName} at ref '${targetRef}'. If this is a private repository, please supply a GitHub Personal Access Token with repo read permissions.`,
+        error: `Could not retrieve file contents from ${fullName} at ref '${targetRef}'. If this is a private repository, please supply a GitHub Personal Access Token in settings.`,
       });
     }
 
-    // Sort fetched files by path
     fetchedFiles.sort((a, b) => a.path.localeCompare(b.path));
+    const chunks: FileChunk[] = fetchedFiles.flatMap(chunkFileContent);
 
-    // Create chunks
-    const chunks: FileChunk[] = fetchedFiles.flatMap(createChunksFromFile);
-
-    // Category counts
     const categoryCounts = {
       doc: fetchedFiles.filter((f) => f.fileCategory === 'doc').length,
       code: fetchedFiles.filter((f) => f.fileCategory === 'code').length,
@@ -972,54 +929,7 @@ app.post('/api/repo/ingest', async (req, res) => {
   }
 });
 
-// Retrieval helper: rank chunks based on query keywords, symbols, paths, and category
-function retrieveRelevantChunks(
-  query: string,
-  chunks: FileChunk[],
-  topK: number = 10
-): FileChunk[] {
-  const terms = query
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length > 2 && !['what', 'how', 'when', 'where', 'which', 'this', 'that', 'with', 'from', 'repo', 'does', 'have'].includes(t));
-
-  if (terms.length === 0) {
-    return chunks.slice(0, topK);
-  }
-
-  const scored = chunks.map((chunk) => {
-    let score = 0;
-    const lowerContent = chunk.content.toLowerCase();
-    const lowerPath = chunk.filePath.toLowerCase();
-    const lowerSymbol = (chunk.symbolName || '').toLowerCase();
-
-    // Direct filename / path match
-    for (const term of terms) {
-      if (lowerPath.includes(term)) score += 8;
-      if (lowerSymbol.includes(term)) score += 10;
-      
-      const countInContent = (lowerContent.match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
-      score += Math.min(countInContent, 5) * 2;
-    }
-
-    // Boost docs for general architectural / overview queries
-    if (query.toLowerCase().includes('what') || query.toLowerCase().includes('overview') || query.toLowerCase().includes('explain')) {
-      if (chunk.fileCategory === 'doc') score += 4;
-    }
-
-    // Boost code for function / implementation / type queries
-    if (query.toLowerCase().includes('function') || query.toLowerCase().includes('class') || query.toLowerCase().includes('code') || query.toLowerCase().includes('internal') || query.toLowerCase().includes('how')) {
-      if (chunk.fileCategory === 'code') score += 4;
-    }
-
-    return { chunk, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topK).map((s) => s.chunk);
-}
-
-// Resilient Gemini content generation with exponential backoff and fallback models
+// Resilient Gemini generation with exponential backoff & fallbacks
 async function generateContentWithRetry(
   params: {
     contents: string | any[];
@@ -1030,7 +940,6 @@ async function generateContentWithRetry(
   },
   maxRetries = 3
 ) {
-  // Support user-selected model (gemini-3.7-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite)
   const targetModel = params.preferredModel || 'gemini-3.7-flash';
   const modelsToTry = [
     targetModel,
@@ -1078,27 +987,19 @@ async function generateContentWithRetry(
   throw lastError;
 }
 
-// Chat / Q&A endpoint
+// 7. Chat / Q&A endpoint using BM25 Inverted Index Context Budget Optimizer
 app.post('/api/repo/query', async (req, res) => {
-  const { question, messages, repoSource, chunks, files, answerMode = 'detailed', model = 'gemini-3.7-flash' } = req.body;
+  const { question, repoSource, chunks, files, answerMode = 'detailed', model = 'gemini-3.7-flash' } = req.body;
 
   if (!question || !repoSource) {
     return res.status(400).json({ error: 'Question and repoSource are required' });
   }
 
   try {
-    // 1. Retrieve top grounded chunks
-    const retrievedChunks = retrieveRelevantChunks(question, chunks || [], 10);
+    // Build token-budget-aware grounded context from BM25 index
+    const { contextString, retrievedChunks } = buildGroundedPromptContext(question, chunks || [], 9500);
+    const repoOutline = generateRepositoryOutline(files || [], 60);
 
-    // 2. Prepare Context string with explicit line numbers and file paths
-    const contextBlock = retrievedChunks
-      .map(
-        (c) =>
-          `=== FILE: ${c.filePath} (Lines ${c.startLine}-${c.endLine}) [Category: ${c.fileCategory}] ===\n${c.content}\n`
-      )
-      .join('\n');
-
-    // 3. System prompt enforcing strict single-repo grounding
     const answerModeInstructions: Record<AnswerMode, string> = {
       concise: 'Provide a direct, concise response highlighting the essential facts and line references without fluff.',
       detailed: 'Provide a thorough, comprehensive technical breakdown with deep code context, explanations, and citations.',
@@ -1108,45 +1009,41 @@ app.post('/api/repo/query', async (req, res) => {
     };
 
     const systemInstruction = `You are RepoNotebook, a repository-grounded assistant.
-Your ONLY knowledge source for this notebook is the GitHub repository: ${repoSource.fullName} (${repoSource.repoUrl}) on ref: ${repoSource.selectedRef}.
+Your ONLY knowledge source for this notebook is the repository: ${repoSource.fullName} (${repoSource.repoUrl}) on ref: ${repoSource.selectedRef}.
 
 CRITICAL GROUNDING RULES:
-1. Answer using ONLY the repository contents provided in the context below.
+1. Answer using ONLY the repository contents and directory structure provided below.
 2. CITE SPECIFIC FILES AND LINE RANGES for every factual statement, API, feature, configuration, and code snippet.
    Use the exact citation tag format: [filepath:L<start>-L<end>] (e.g. [README.md:L5-L18] or [src/vanilla.ts:L34-L52]).
 3. If the user asks something that is NOT found in the provided repository context, explicitly state: "I could not find this in the repository ${repoSource.fullName}."
-4. STRICT REFUSAL OF EXTERNAL TOPICS: If asked about general knowledge, external libraries not in this repo, or other repositories, politely explain that this RepoNotebook is strictly bound to ${repoSource.fullName} and cannot reference external sources.
-5. Do NOT invent APIs, files, methods, configuration flags, or dependencies.
-6. Clearly distinguish between what is directly stated in code/docs vs inferred.
-7. Style Guideline: ${answerModeInstructions[answerMode as AnswerMode] || answerModeInstructions.detailed}`;
+4. STRICT REFUSAL OF EXTERNAL TOPICS: If asked about external libraries not present in this repo or unrelated questions, politely explain that this RepoNotebook is strictly bound to ${repoSource.fullName}.
+5. Style Guideline: ${answerModeInstructions[answerMode as AnswerMode] || answerModeInstructions.detailed}`;
 
-    const promptText = `Grounding Context from ${repoSource.fullName}:\n\n${contextBlock}\n\nUser Question: ${question}\n\nAnswer with precise citations [filepath:L<start>-L<end>]:`;
+    const promptText = `${repoOutline}\n\n${contextString}\n\nUser Question: ${question}\n\nAnswer with precise citations [filepath:L<start>-L<end>]:`;
 
-    // 4. Call Gemini with retry & fallback using chosen model
     const response = await generateContentWithRetry({
       preferredModel: model,
       contents: promptText,
       systemInstruction,
-      temperature: 0.2, // Low temperature for high factual precision
+      temperature: 0.2,
     });
 
     const replyText = response.text || 'I could not generate an answer from the repository context.';
 
-    // 5. Extract Citations from reply text
+    // Extract Citations from reply text
     const citationRegex = /\[([a-zA-Z0-9_\-./]+):L(\d+)(?:-L?(\d+))?\]/g;
     const citations: Citation[] = [];
     let match;
     const seenKeys = new Set<string>();
 
     while ((match = citationRegex.exec(replyText)) !== null) {
-      const [fullMatch, filePath, startStr, endStr] = match;
+      const [, filePath, startStr, endStr] = match;
       const startLine = parseInt(startStr, 10);
       const endLine = endStr ? parseInt(endStr, 10) : startLine;
       const key = `${filePath}:${startLine}-${endLine}`;
 
       if (!seenKeys.has(key)) {
         seenKeys.add(key);
-        // Find corresponding file snippet
         const matchingFile = (files as SourceFile[] || []).find((f) => f.path === filePath);
         let snippet = '';
         if (matchingFile) {
@@ -1165,7 +1062,6 @@ CRITICAL GROUNDING RULES:
       }
     }
 
-    // If no explicit regex citations were captured but retrieved chunks were used, anchor with the top chunk
     if (citations.length === 0 && retrievedChunks.length > 0 && !replyText.includes('could not find this')) {
       const top = retrievedChunks[0];
       citations.push({
@@ -1178,7 +1074,7 @@ CRITICAL GROUNDING RULES:
       });
     }
 
-    // 6. Generate 3 smart follow-up suggestions
+    // Smart Follow-Up Suggestions
     let suggestedFollowUps: string[] = [
       'How does this integrate with the rest of the codebase?',
       'What are the error handling mechanisms used here?',
@@ -1199,16 +1095,14 @@ CRITICAL GROUNDING RULES:
         }
       }
     } catch {
-      // Keep defaults on suggestion failure
+      // fallback
     }
-
-    const confidence = replyText.includes('could not find this') ? 'not_found' : 'grounded';
 
     return res.json({
       content: replyText,
       citations,
-      suggestedFollowUps: Array.isArray(suggestedFollowUps) ? suggestedFollowUps.slice(0, 3) : [],
-      confidence,
+      suggestedFollowUps,
+      confidence: replyText.includes('could not find this') ? 'not_found' : 'grounded',
       modelUsed: model,
     });
   } catch (error: any) {
@@ -1217,7 +1111,7 @@ CRITICAL GROUNDING RULES:
   }
 });
 
-// Artifact generation endpoint
+// 8. Artifact Generation Endpoint using BM25 Index
 app.post('/api/repo/artifact', async (req, res) => {
   const { artifactType, repoSource, chunks, files } = req.body;
 
@@ -1225,227 +1119,150 @@ app.post('/api/repo/artifact', async (req, res) => {
     return res.status(400).json({ error: 'artifactType and repoSource are required' });
   }
 
-  const type = artifactType as ArtifactType;
-
-  // Filter chunks relevant to the requested artifact type
-  let relevantChunks: FileChunk[] = (chunks as FileChunk[]) || [];
-
-  if (type === 'overview' || type === 'getting_started') {
-    relevantChunks = relevantChunks.filter((c) => c.fileCategory === 'doc' || c.filePath.includes('package') || c.filePath.includes('README'));
-  } else if (type === 'mindmap' || type === 'architecture') {
-    relevantChunks = relevantChunks.filter((c) => c.fileCategory === 'code' || c.fileCategory === 'doc' || c.filePath.includes('index') || c.filePath.includes('src'));
-  } else if (type === 'slideshow') {
-    relevantChunks = relevantChunks.filter((c) => c.fileCategory === 'doc' || c.fileCategory === 'code' || c.filePath.includes('README'));
-  } else if (type === 'testing') {
-    relevantChunks = relevantChunks.filter((c) => c.fileCategory === 'test' || c.filePath.includes('test') || c.filePath.includes('vitest') || c.filePath.includes('jest'));
-  } else if (type === 'deployment_ci') {
-    relevantChunks = relevantChunks.filter((c) => c.fileCategory === 'workflow' || c.fileCategory === 'config');
-  } else if (type === 'dependency_map') {
-    relevantChunks = relevantChunks.filter((c) => c.fileCategory === 'config' || c.filePath.includes('package.json') || c.filePath.includes('Cargo.toml') || c.filePath.includes('go.mod'));
-  }
-
-  if (relevantChunks.length < 5) {
-    relevantChunks = (chunks as FileChunk[]) || [];
-  }
-
-  const contextBlock = relevantChunks
-    .slice(0, 15)
-    .map(
-      (c) =>
-        `=== FILE: ${c.filePath} (Lines ${c.startLine}-${c.endLine}) [Category: ${c.fileCategory}] ===\n${c.content}\n`
-    )
-    .join('\n');
-
-  const artifactPrompts: Record<ArtifactType, { title: string; instruction: string }> = {
+  const typePrompts: Record<ArtifactType, { title: string; instruction: string; queryTerms: string }> = {
     overview: {
-      title: 'Repository Overview',
-      instruction: 'Create a comprehensive executive overview of what this repository does, its primary purpose, core features, target audience, and key technical capabilities with citations.',
+      title: 'Repository Overview & Executive Summary',
+      instruction: 'Create a comprehensive executive overview of the repository, including core mission, primary components, technology stack, and architecture highlights.',
+      queryTerms: 'readme overview architecture introduction purpose license dependencies',
     },
     mindmap: {
-      title: 'Interactive Codebase Mindmap',
-      instruction: `Generate an interactive, hierarchical codebase mindmap for ${repoSource.fullName}.
-Your output MUST include:
-1. A clean Mermaid mindmap block:
-\`\`\`mermaid
-mindmap
-  root(("${repoSource.name}"))
-    ["Architecture & Entry Points"]
-      ["Main Entry / Exports"]
-      ["Core Engine & Lifecycle"]
-    ["Core Modules & Types"]
-      ["Primary Stores / State"]
-      ["Internal Abstractions"]
-    ["API & Public Surface"]
-      ["Consumer Functions / Hooks"]
-      ["Middleware & Plugins"]
-    ["Tooling & Quality"]
-      ["Test Suites"]
-      ["CI/CD Pipelines"]
-\`\`\`
-2. A detailed structured outline explaining each branch and node in detail with exact line citations: [filepath:L<start>-L<end>].
-3. Key relationships and data flows between modules.`,
+      title: 'Repository Architecture Mindmap',
+      instruction: 'Generate a clean, hierarchical Mermaid.js mindmap illustrating the repository modules, packages, layers, and entry points, followed by bullet point descriptions with line citations.',
+      queryTerms: 'architecture index main entry module package component structure',
     },
     slideshow: {
-      title: 'Repository Deep-Dive Slide Deck',
-      instruction: `Generate an interactive 7-9 slide technical presentation deck for repository ${repoSource.fullName}.
-Format each slide separated by '---' delimiters.
-Each slide must include:
-# Slide [Number]: [Title]
-### [Subtitle / Theme]
-- High-impact bullet points explaining architectural decisions, APIs, and patterns
-- Code snippets (\`\`\`lang ... \`\`\`) where relevant
-- Citations anchored in source files: [filepath:L<start>-L<end>]
-- **Speaker Notes**: Key talking points for the presenter
-
-Include slides for:
-1. Introduction & Mission
-2. Architecture Overview
-3. Core Entry Points & State Lifecycle
-4. Main API Surface & Usage Patterns
-5. Internal Mechanisms & Algorithms
-6. Testing & Build Workflows
-7. Extensibility, Gotchas & Roadmap`,
+      title: 'Technical Presentation Slides',
+      instruction: 'Create a 5-6 slide technical presentation deck in Markdown using "# Slide X: Title" separators, complete with bullet points, code snippets, and speaker notes.',
+      queryTerms: 'readme overview get started usage api architecture tests',
     },
     getting_started: {
-      title: 'Getting Started Guide',
-      instruction: 'Generate a step-by-step developer setup and usage guide including installation, environment setup, initial store/client creation, and execution instructions cited from the repo.',
+      title: 'Developer Quickstart & Setup Guide',
+      instruction: 'Write an actionable step-by-step developer getting-started guide covering prerequisites, installation, local execution, and environment setup.',
+      queryTerms: 'install setup run dev build package scripts getting started readme',
     },
     architecture: {
-      title: 'Architecture & Design Summary',
-      instruction: 'Detail the high-level architecture, module relationships, state/data lifecycle, core design patterns, and internal abstractions backed by source citations.',
+      title: 'System Architecture & Data Flow',
+      instruction: 'Detail the complete architectural design, data pipelines, state containers, and subsystem boundaries with deep code citations.',
+      queryTerms: 'architecture store state engine core service data flow',
     },
     glossary: {
-      title: 'Key Concepts & Terms Glossary',
-      instruction: 'Compile a curated glossary of the 5-10 most critical domain concepts, types, classes, and exported interfaces in this repository with their definitions and file locations.',
+      title: 'Domain Glossary & Key Terminology',
+      instruction: 'Build an alphabetized technical glossary explaining key domain concepts, types, classes, and terminology specific to this repository.',
+      queryTerms: 'type interface class enum model schema definition',
     },
     api_surface: {
-      title: 'API Surface & Exported Interface Summary',
-      instruction: 'Document all main public APIs, exported functions, hook signatures, configuration parameters, and types available to consumers of this package.',
+      title: 'Public API Surface & Types Catalog',
+      instruction: 'Document the exported public API surface, functions, parameters, return types, and interfaces.',
+      queryTerms: 'export function interface type class api public index',
     },
     folder_structure: {
-      title: 'Folder Structure & Directory Explainer',
-      instruction: 'Provide a structured breakdown of each directory and key file in the repository, explaining the responsibility and purpose of each path.',
+      title: 'Directory Tree & File Layout Guide',
+      instruction: 'Explain the directory layout, folder purposes, and organizational conventions across the project.',
+      queryTerms: 'src lib app docs tests config workflows directory structure',
     },
     dependency_map: {
-      title: 'Dependency Map & Ecosystem Analysis',
-      instruction: 'Analyze the runtime dependencies, peer dependencies, and dev tooling defined in the package/configuration manifests and explain what each is used for.',
+      title: 'Dependencies & Tooling Ecosystem',
+      instruction: 'Analyze runtime dependencies, dev tooling, build chains, and external libraries declared in project manifests.',
+      queryTerms: 'package.json dependencies devDependencies cargo.toml pyproject.toml go.mod',
     },
     testing: {
-      title: 'Testing Strategy & Coverage Overview',
-      instruction: 'Review the testing frameworks, test suite organization, key test cases, mock strategies, and execution commands present in the repository.',
+      title: 'Test Suite & Quality Verification',
+      instruction: 'Document the testing framework, unit test coverage, test utilities, and verification commands.',
+      queryTerms: 'test spec vitest jest pytest testing suite mock assert',
     },
     deployment_ci: {
-      title: 'CI/CD & Deployment Workflows',
-      instruction: 'Summarize the automated workflows, GitHub Actions pipelines, build scripts, linting, and release pipelines configured in the repo.',
+      title: 'CI/CD Pipelines & Deployment',
+      instruction: 'Explain the GitHub Actions workflows, build pipelines, release automation, and deployment configurations.',
+      queryTerms: 'workflows ci action build deploy docker yaml',
     },
     faq: {
       title: 'Frequently Asked Questions (FAQ)',
-      instruction: 'Generate 5-7 frequently asked questions about using, configuring, troubleshooting, and extending this codebase, complete with grounded answers and citations.',
+      instruction: 'Provide a structured FAQ covering common questions, troubleshooting scenarios, and edge-case behaviors.',
+      queryTerms: 'troubleshooting error faq common issue question pitfall',
     },
     onboarding: {
-      title: 'New Contributor Onboarding Checklist',
-      instruction: 'Create an actionable onboarding roadmap for a new engineer or open-source contributor: prerequisites, local setup, running tests, codebase navigation landmarks, and contribution guidelines.',
+      title: 'New Engineer Onboarding Checklist',
+      instruction: 'Create a 30-day engineer onboarding roadmap, initial codebase walkthrough, and recommended reading order.',
+      queryTerms: 'readme getting started architecture tests contributing guide',
     },
     risks_rough_edges: {
-      title: 'Risks, Missing Docs & Rough Edges',
-      instruction: 'Identify potential architectural risks, undocumented features, missing tests, deprecated patterns, or rough edges observed across the repository files.',
+      title: 'Technical Debt & Rough Edges Analysis',
+      instruction: 'Highlight potential technical debt, TODOs, performance considerations, and tricky code sections.',
+      queryTerms: 'todo fixme deprecate error edge case performance risk',
     },
     change_summary: {
-      title: 'Release & Versioning Summary',
-      instruction: 'Summarize the package version, licensing, release artifacts, and core configuration changes grounded in package manifests and docs.',
+      title: 'Release Highlights & Change Summary',
+      instruction: 'Summarize key features, versions, and evolution milestones reflected in the repo code and documentation.',
+      queryTerms: 'version changelog release readme new feature update',
     },
   };
 
-  const selectedArtifact = artifactPrompts[type] || artifactPrompts.overview;
+  const artifactSpec = typePrompts[artifactType as ArtifactType] || typePrompts.overview;
 
   try {
+    const { contextString } = buildGroundedPromptContext(artifactSpec.queryTerms, chunks || [], 11000);
+    const repoOutline = generateRepositoryOutline(files || [], 70);
+
+    const systemInstruction = `You are RepoNotebook's Research Artifact Engine.
+You are generating a formal research artifact for: ${repoSource.fullName}.
+Ground everything strictly in the provided codebase context and cite files using [filepath:L<start>-L<end>].`;
+
+    const promptText = `${repoOutline}\n\n${contextString}\n\nArtifact Task: ${artifactSpec.instruction}\n\nGenerate the complete Markdown artifact titled "${artifactSpec.title}":`;
+
     const response = await generateContentWithRetry({
-      preferredModel: 'gemini-2.5-flash',
-      contents: `You are generating a NotebookLM research artifact for the repository ${repoSource.fullName}.\n\nTask: ${selectedArtifact.instruction}\n\nGrounding Context:\n${contextBlock}\n\nFormat with clean Markdown headers (##, ###), bullet points, code blocks where appropriate, and cite specific file paths and lines with [filepath:L<start>-L<end>].`,
-      systemInstruction: `You are RepoNotebook. Generate rigorous, citation-backed artifacts strictly from the provided repository evidence.`,
-      temperature: 0.2,
+      contents: promptText,
+      systemInstruction,
+      temperature: 0.25,
     });
 
-    const content = response.text || 'Could not generate artifact.';
+    const content = response.text || `# ${artifactSpec.title}\n\nCould not generate artifact.`;
 
-    // Parse citations
+    // Extract Citations
     const citationRegex = /\[([a-zA-Z0-9_\-./]+):L(\d+)(?:-L?(\d+))?\]/g;
     const citations: Citation[] = [];
     let match;
-    const seenKeys = new Set<string>();
+    const seen = new Set<string>();
 
     while ((match = citationRegex.exec(content)) !== null) {
-      const [fullMatch, filePath, startStr, endStr] = match;
+      const [, filePath, startStr, endStr] = match;
       const startLine = parseInt(startStr, 10);
       const endLine = endStr ? parseInt(endStr, 10) : startLine;
       const key = `${filePath}:${startLine}-${endLine}`;
-
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
+      if (!seen.has(key)) {
+        seen.add(key);
         const matchingFile = (files as SourceFile[] || []).find((f) => f.path === filePath);
-        let snippet = '';
-        if (matchingFile) {
-          const lines = matchingFile.content.split('\n');
-          snippet = lines.slice(Math.max(0, startLine - 1), Math.min(lines.length, endLine)).join('\n');
-        }
-
         citations.push({
-          id: `art-cit-${citations.length + 1}`,
+          id: `cit-art-${citations.length + 1}`,
           filePath,
           startLine,
           endLine,
-          snippet,
-          fileCategory: matchingFile?.fileCategory || 'doc',
+          fileCategory: matchingFile?.fileCategory || 'code',
         });
       }
     }
 
     return res.json({
-      id: `art-${Date.now()}`,
-      type,
-      title: selectedArtifact.title,
-      content,
-      citations,
-      createdAt: new Date().toISOString(),
+      artifact: {
+        id: `art-${artifactType}-${Date.now()}`,
+        notebookId: repoSource.fullName,
+        type: artifactType,
+        title: artifactSpec.title,
+        content,
+        citations,
+        createdAt: new Date().toISOString(),
+      },
     });
   } catch (error: any) {
-    console.error('Artifact error:', error);
+    console.error('Artifact generation error:', error);
     return res.status(500).json({ error: `Artifact generation failed: ${error.message}` });
   }
 });
 
-// Merge notes into a synthesized research briefing
-app.post('/api/notes/merge', async (req, res) => {
-  const { notes, repoSource } = req.body;
-
-  if (!notes || !Array.isArray(notes) || notes.length === 0) {
-    return res.status(400).json({ error: 'At least one note is required to merge' });
-  }
-
-  const notesText = notes
-    .map((n: any, i: number) => `### Note ${i + 1}: ${n.title}\n${n.content}\nTags: ${(n.tags || []).join(', ')}\n`)
-    .join('\n---\n\n');
-
-  try {
-    const response = await generateContentWithRetry({
-      preferredModel: 'gemini-2.5-flash',
-      contents: `Synthesize the following research notes into a cohesive, structured Executive Briefing and Research Summary for repository ${repoSource?.fullName || 'the repository'}:\n\n${notesText}\n\nOrganize into Executive Summary, Key Technical Findings, Open Questions, and Actionable Next Steps. Maintain all file citations.`,
-      systemInstruction: `You are RepoNotebook's research synthesizer. Create high-clarity synthesized briefings from user notes.`,
-      temperature: 0.3,
-    });
-
-    return res.json({
-      title: `Executive Briefing: ${repoSource?.name || 'Repository'} Synthesis`,
-      content: response.text || 'Failed to synthesize notes.',
-      createdAt: new Date().toISOString(),
-    });
-  } catch (error: any) {
-    return res.status(500).json({ error: `Failed to merge notes: ${error.message}` });
-  }
-});
-
-// Start Express Server with Vite integration
+// Vite Middleware & SPA Serving
 async function startServer() {
+  // Ensure SQLite DB initialized
+  await getDatabase();
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1461,7 +1278,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`RepoNotebook Server running on http://localhost:${PORT}`);
+    console.log(`RepoNotebook Server running on http://0.0.0.0:${PORT}`);
   });
 }
 

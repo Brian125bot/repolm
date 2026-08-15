@@ -232,9 +232,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
 
                 <div className="text-[11px] text-[#8B949E] font-mono flex items-center justify-between border-t border-[#30363D] pt-2">
-                  <span>Disk Path: <code>.reponotebook_data/notebooks.json</code></span>
-                  <span>
-                    {stats?.diskUsageBytes ? `${Math.round(stats.diskUsageBytes / 1024)} KB` : 'Local Storage'}
+                  <span className="truncate max-w-[320px]">
+                    Storage: <code>{stats?.storagePath || '.reponotebook_data/reponotebook.sqlite'}</code>
+                  </span>
+                  <span className="shrink-0 ml-2">
+                    {stats?.diskUsageBytes ? `${Math.round(stats.diskUsageBytes / 1024)} KB` : 'SQLite DB'}
                   </span>
                 </div>
               </div>
