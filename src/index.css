@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+@layer base {
+  * {
+    border-color: #30363D;
+  }
+  body {
+    background-color: #0D1117;
+    color: #C9D1D9;
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+  code, pre, kbd, samp {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+}
+
+/* Custom compact scrollbar for high density layout */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0D1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #30363D;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #484F58;
+}
+
+/* High density markdown prose adjustments */
+.prose {
+  color: #C9D1D9 !important;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  color: #F0F6FC !important;
+  font-weight: 600;
+}
+
+.prose strong {
+  color: #F0F6FC !important;
+}
+
+.prose a {
+  color: #58A6FF !important;
+  text-decoration: underline;
+}
+
+.prose blockquote {
+  border-left-color: #30363D !important;
+  color: #8B949E !important;
+}
+
+.prose hr {
+  border-color: #30363D !important;
+}
+
+.prose code:not(pre code) {
+  background-color: #161B22 !important;
+  color: #58A6FF !important;
+  border: 1px solid #30363D !important;
+  border-radius: 4px;
+  padding: 0.15rem 0.35rem;
+}
