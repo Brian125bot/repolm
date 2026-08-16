@@ -277,6 +277,5 @@ npm start
 
 ---
 
-## 📄 License & Credits
-Built for **Google AI Studio** with the `@google/genai` TypeScript SDK and Gemini 3.7 Flash, 3.5 Flash Lite, and 3.1 Flash Lite.
+
 
