@@ -32,7 +32,12 @@ export async function getDatabase(): Promise<Database> {
     if (fs.existsSync(SQLITE_FILE)) {
       try {
         const fileBuffer = await fsPromises.readFile(SQLITE_FILE);
-        dbInstance = new SQL.Database(fileBuffer);
+        if (fileBuffer && fileBuffer.length > 50) {
+          dbInstance = new SQL.Database(fileBuffer);
+          dbInstance.exec('PRAGMA schema_version;');
+        } else {
+          dbInstance = new SQL.Database();
+        }
       } catch (err) {
         console.warn('[SQLite] Failed to load existing database file, creating fresh DB:', err);
         dbInstance = new SQL.Database();
@@ -41,102 +46,111 @@ export async function getDatabase(): Promise<Database> {
       dbInstance = new SQL.Database();
     }
 
-    // Create Tables Schema
-    dbInstance.run(`
-      CREATE TABLE IF NOT EXISTS notebooks (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        repo_url TEXT NOT NULL,
-        ref TEXT NOT NULL,
-        path_filter TEXT,
-        index_status TEXT NOT NULL,
-        index_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        source_json TEXT NOT NULL,
-        suggested_questions_json TEXT
-      );
+    const initSchema = (db: Database) => {
+      db.run(`
+        CREATE TABLE IF NOT EXISTS notebooks (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          repo_url TEXT NOT NULL,
+          ref TEXT NOT NULL,
+          path_filter TEXT,
+          index_status TEXT NOT NULL,
+          index_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          source_json TEXT NOT NULL,
+          suggested_questions_json TEXT
+        );
 
-      CREATE TABLE IF NOT EXISTS files (
-        id TEXT PRIMARY KEY,
-        notebook_id TEXT NOT NULL,
-        path TEXT NOT NULL,
-        language TEXT NOT NULL,
-        file_category TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        line_count INTEGER NOT NULL,
-        content TEXT NOT NULL,
-        FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
-      );
+        CREATE TABLE IF NOT EXISTS files (
+          id TEXT PRIMARY KEY,
+          notebook_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          language TEXT NOT NULL,
+          file_category TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          line_count INTEGER NOT NULL,
+          content TEXT NOT NULL,
+          FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
+        );
 
-      CREATE TABLE IF NOT EXISTS chunks (
-        id TEXT PRIMARY KEY,
-        notebook_id TEXT NOT NULL,
-        file_id TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        start_line INTEGER NOT NULL,
-        end_line INTEGER NOT NULL,
-        chunk_type TEXT NOT NULL,
-        symbol_name TEXT,
-        content TEXT NOT NULL,
-        language TEXT NOT NULL,
-        file_category TEXT NOT NULL,
-        FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
-      );
+        CREATE TABLE IF NOT EXISTS chunks (
+          id TEXT PRIMARY KEY,
+          notebook_id TEXT NOT NULL,
+          file_id TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL,
+          chunk_type TEXT NOT NULL,
+          symbol_name TEXT,
+          content TEXT NOT NULL,
+          language TEXT NOT NULL,
+          file_category TEXT NOT NULL,
+          FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
+        );
 
-      CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        notebook_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        citations_json TEXT,
-        suggested_follow_ups_json TEXT,
-        created_at TEXT NOT NULL,
-        answer_mode TEXT,
-        confidence TEXT,
-        model_used TEXT,
-        FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
-      );
+        CREATE TABLE IF NOT EXISTS messages (
+          id TEXT PRIMARY KEY,
+          notebook_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          citations_json TEXT,
+          suggested_follow_ups_json TEXT,
+          created_at TEXT NOT NULL,
+          answer_mode TEXT,
+          confidence TEXT,
+          model_used TEXT,
+          FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
+        );
 
-      CREATE TABLE IF NOT EXISTS notes (
-        id TEXT PRIMARY KEY,
-        notebook_id TEXT NOT NULL,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        tags_json TEXT,
-        citations_json TEXT,
-        source_message_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
-      );
+        CREATE TABLE IF NOT EXISTS notes (
+          id TEXT PRIMARY KEY,
+          notebook_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          content TEXT NOT NULL,
+          tags_json TEXT,
+          citations_json TEXT,
+          source_message_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
+        );
 
-      CREATE TABLE IF NOT EXISTS artifacts (
-        id TEXT PRIMARY KEY,
-        notebook_id TEXT NOT NULL,
-        type TEXT NOT NULL,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        citations_json TEXT,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
-      );
+        CREATE TABLE IF NOT EXISTS artifacts (
+          id TEXT PRIMARY KEY,
+          notebook_id TEXT NOT NULL,
+          type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          content TEXT NOT NULL,
+          citations_json TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
+        );
 
-      CREATE TABLE IF NOT EXISTS pinned_citations (
-        id TEXT PRIMARY KEY,
-        notebook_id TEXT NOT NULL,
-        citation_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
-      );
+        CREATE TABLE IF NOT EXISTS pinned_citations (
+          id TEXT PRIMARY KEY,
+          notebook_id TEXT NOT NULL,
+          citation_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (notebook_id) REFERENCES notebooks(id) ON DELETE CASCADE
+        );
 
-      CREATE INDEX IF NOT EXISTS idx_files_notebook ON files(notebook_id);
-      CREATE INDEX IF NOT EXISTS idx_chunks_notebook ON chunks(notebook_id);
-      CREATE INDEX IF NOT EXISTS idx_messages_notebook ON messages(notebook_id);
-      CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes(notebook_id);
-      CREATE INDEX IF NOT EXISTS idx_artifacts_notebook ON artifacts(notebook_id);
-      CREATE INDEX IF NOT EXISTS idx_pins_notebook ON pinned_citations(notebook_id);
-    `);
+        CREATE INDEX IF NOT EXISTS idx_files_notebook ON files(notebook_id);
+        CREATE INDEX IF NOT EXISTS idx_chunks_notebook ON chunks(notebook_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_notebook ON messages(notebook_id);
+        CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes(notebook_id);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_notebook ON artifacts(notebook_id);
+        CREATE INDEX IF NOT EXISTS idx_pins_notebook ON pinned_citations(notebook_id);
+      `);
+    };
+
+    try {
+      initSchema(dbInstance);
+    } catch (schemaErr) {
+      console.warn('[SQLite] Recreating fresh in-memory database after schema load issue:', schemaErr);
+      dbInstance = new SQL.Database();
+      initSchema(dbInstance);
+    }
 
     // Check if database has any notebooks
     const countRes = dbInstance.exec('SELECT COUNT(*) AS total FROM notebooks;');
@@ -216,7 +230,7 @@ function insertNotebookInternal(db: Database, nb: Notebook): void {
   if (Array.isArray(nb.files)) {
     for (const f of nb.files) {
       db.run(
-        `INSERT INTO files (id, notebook_id, path, language, file_category, size, line_count, content)
+        `INSERT OR REPLACE INTO files (id, notebook_id, path, language, file_category, size, line_count, content)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
         [f.id, nb.id, f.path, f.language, f.fileCategory, f.size, f.lineCount, f.content]
       );
@@ -227,7 +241,7 @@ function insertNotebookInternal(db: Database, nb: Notebook): void {
   if (Array.isArray(nb.chunks)) {
     for (const c of nb.chunks) {
       db.run(
-        `INSERT INTO chunks (id, notebook_id, file_id, file_path, start_line, end_line, chunk_type, symbol_name, content, language, file_category)
+        `INSERT OR REPLACE INTO chunks (id, notebook_id, file_id, file_path, start_line, end_line, chunk_type, symbol_name, content, language, file_category)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [c.id, nb.id, c.fileId, c.filePath, c.startLine, c.endLine, c.chunkType, c.symbolName || null, c.content, c.language, c.fileCategory]
       );
@@ -556,8 +570,17 @@ export async function getStorageDiagnostics(): Promise<StorageStats> {
       totalArtifacts: countTable('artifacts'),
       diskUsageBytes: size,
       storagePath: '.reponotebook_data/reponotebook.sqlite (SQLite Concurrency-Safe)',
+      storageType: 'sqlite',
       isDiskAvailable: true,
       lastSavedAt: mtime.toISOString(),
     };
   });
+}
+
+/**
+ * Get a single notebook by ID
+ */
+export async function getNotebookById(id: string): Promise<Notebook | null> {
+  const notebooks = await getAllNotebooks();
+  return notebooks.find((n) => n.id === id) || null;
 }

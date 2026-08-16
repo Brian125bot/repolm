@@ -1,6 +1,6 @@
 import { SourceFile, FileChunk, FileCategory } from '../src/types';
 
-const STOP_WORDS = new Set([
+export const STOP_WORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'he',
   'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the', 'to', 'was', 'were',
   'will', 'with', 'this', 'then', 'there', 'what', 'how', 'when', 'where',
@@ -129,7 +129,7 @@ function determineChunkType(content: string, category: FileCategory): FileChunk[
 /**
  * Tokenize string into normalized terms
  */
-function tokenize(text: string): string[] {
+export function tokenize(text: string): string[] {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9_$-]/g, ' ')
@@ -264,10 +264,10 @@ export class InvertedIndex {
 export function buildGroundedPromptContext(
   query: string,
   allChunks: FileChunk[],
-  maxTokenBudget: number = 9000
+  maxTokenBudget: number = 12000
 ): { contextString: string; retrievedChunks: FileChunk[] } {
   const index = new InvertedIndex(allChunks);
-  const candidateChunks = index.search(query, 25);
+  const candidateChunks = index.search(query, 40);
 
   let currentTokenEst = 0;
   const selectedChunks: FileChunk[] = [];
@@ -276,7 +276,7 @@ export function buildGroundedPromptContext(
   for (const chunk of candidateChunks) {
     // 1 token ~ 3.8 chars
     const chunkTokens = Math.ceil(chunk.content.length / 3.8) + 40;
-    if (currentTokenEst + chunkTokens > maxTokenBudget && selectedChunks.length >= 5) {
+    if (currentTokenEst + chunkTokens > maxTokenBudget && selectedChunks.length >= 8) {
       break;
     }
 

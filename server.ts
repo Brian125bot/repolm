@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
@@ -25,20 +25,114 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Gemini SDK
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Startup Environment Validation
+function validateEnvironment(): void {
+  const missingVars: string[] = [];
+  if (!process.env.GEMINI_API_KEY) {
+    missingVars.push('GEMINI_API_KEY');
+  }
+
+  if (missingVars.length > 0) {
+    console.warn(
+      `[Startup Warning] Missing environment variable(s): ${missingVars.join(', ')}. AI chat & artifact generation will require a valid Gemini API key.`
+    );
+  } else {
+    console.log('[Startup] Environment validated: GEMINI_API_KEY is present.');
+  }
+}
+
+validateEnvironment();
+
+// Lazy Gemini SDK Initialization
+let aiClient: GoogleGenAI | null = null;
+
+function getGeminiClient(): GoogleGenAI {
+  if (!aiClient) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error('GEMINI_API_KEY environment variable is not configured');
+    }
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+  }
+  return aiClient;
+}
 
 const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: '50mb' }));
+
+// Structured Request Logging Middleware with Request Tracing
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const reqId = Math.random().toString(36).substring(2, 9);
+  const start = Date.now();
+  (req as any).reqId = reqId;
+
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const logData = {
+      timestamp: new Date().toISOString(),
+      reqId,
+      method: req.method,
+      url: req.originalUrl,
+      status: res.statusCode,
+      durationMs: duration,
+    };
+    if (res.statusCode >= 400) {
+      console.warn(`[HTTP ${res.statusCode}]`, JSON.stringify(logData));
+    } else if (!req.originalUrl.startsWith('/@') && !req.originalUrl.includes('node_modules')) {
+      console.log(`[HTTP ${res.statusCode}]`, JSON.stringify(logData));
+    }
+  });
+
+  next();
+});
+
+// In-Memory API Rate Limiter
+interface RateLimitRecord {
+  count: number;
+  resetTime: number;
+}
+const rateLimitMap = new Map<string, RateLimitRecord>();
+
+function createRateLimiter(maxRequests: number, windowMs: number, endpointName: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
+    const key = `${endpointName}:${clientIp}`;
+    const now = Date.now();
+
+    const record = rateLimitMap.get(key);
+    if (!record || now > record.resetTime) {
+      rateLimitMap.set(key, {
+        count: 1,
+        resetTime: now + windowMs,
+      });
+      return next();
+    }
+
+    if (record.count >= maxRequests) {
+      const retryAfterSec = Math.ceil((record.resetTime - now) / 1000);
+      res.setHeader('Retry-After', retryAfterSec);
+      return res.status(429).json({
+        error: `Rate limit exceeded for ${endpointName}. Maximum ${maxRequests} requests per ${Math.round(windowMs / 1000)}s allowed.`,
+        retryAfter: retryAfterSec,
+      });
+    }
+
+    record.count += 1;
+    next();
+  };
+}
+
+const queryRateLimiter = createRateLimiter(40, 60000, 'query');
+const ingestRateLimiter = createRateLimiter(20, 60000, 'ingest');
 
 // 1. Healthcheck
 app.get('/api/health', async (_req, res) => {
@@ -352,7 +446,7 @@ app.post('/api/local/scan', async (req, res) => {
 });
 
 // 4. Local Directory Ingestion Endpoint (Supports Hundreds of Files with Syntactic Chunking)
-app.post('/api/local/ingest', async (req, res) => {
+app.post('/api/local/ingest', ingestRateLimiter, async (req, res) => {
   const { localPath, folderName, pathFilter } = req.body;
 
   // Security Sandbox Validation
@@ -523,7 +617,7 @@ app.post('/api/local/ingest', async (req, res) => {
 });
 
 // 5. Upload Folder Ingestion (Drag-and-Drop or Browser Folder Picker)
-app.post('/api/local/upload-folder', async (req, res) => {
+app.post('/api/local/upload-folder', ingestRateLimiter, async (req, res) => {
   const { folderName = 'uploaded-repo', uploadedFiles = [] } = req.body;
 
   if (!Array.isArray(uploadedFiles) || uploadedFiles.length === 0) {
@@ -531,6 +625,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
   }
 
   try {
+    const notebookId = `nb-upload-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     const fetchedFiles: SourceFile[] = [];
 
     for (let idx = 0; idx < uploadedFiles.length; idx++) {
@@ -561,7 +656,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
       const lineCount = file.content.split('\n').length;
 
       fetchedFiles.push({
-        id: `upload-f-${idx}-${cleanPath.replace(/[^a-zA-Z0-9]/g, '_')}`,
+        id: `${notebookId}-f-${idx}-${cleanPath.replace(/[^a-zA-Z0-9]/g, '_')}`,
         path: cleanPath,
         language,
         fileCategory: category,
@@ -622,7 +717,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
     ];
 
     const notebook: Notebook = {
-      id: `nb-upload-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      id: notebookId,
       name: `local/${folderName}`,
       repoUrl: `local://${folderName}`,
       ref: 'local-upload',
@@ -643,7 +738,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
 - **Stored In**: Concurrency-Safe SQLite Database & IndexedDB.
 
 *You can now ask questions, generate mindmaps, slide decks, and architecture summaries grounded in this folder.*`,
-          citations: [
+          citations: fetchedFiles.length > 0 ? [
             {
               id: 'c-upload-intro',
               filePath: fetchedFiles[0].path,
@@ -652,7 +747,7 @@ app.post('/api/local/upload-folder', async (req, res) => {
               snippet: fetchedFiles[0].content.slice(0, 200),
               fileCategory: fetchedFiles[0].fileCategory,
             }
-          ],
+          ] : [],
           suggestedFollowUps: suggestedQuestions.slice(0, 3),
           createdAt: new Date().toISOString(),
           confidence: 'grounded',
@@ -675,12 +770,13 @@ app.post('/api/local/upload-folder', async (req, res) => {
       suggestedQuestions,
     });
   } catch (err: any) {
+    console.error('[Upload folder error]:', err);
     res.status(500).json({ error: `Upload processing failed: ${err.message}` });
   }
 });
 
 // 6. Ingest repository endpoint (Supports Hundreds of Files with Syntactic Chunking)
-app.post('/api/repo/ingest', async (req, res) => {
+app.post('/api/repo/ingest', ingestRateLimiter, async (req, res) => {
   const { repoUrl, ref, githubToken, pathFilter } = req.body;
 
   if (!repoUrl) {
@@ -811,7 +907,7 @@ app.post('/api/repo/ingest', async (req, res) => {
       eligibleFiles = eligibleFiles.filter((item) => item.path.startsWith(cleanFilter));
     }
 
-    // Prioritize high-value files
+    // Balanced priority sorting
     eligibleFiles.sort((a, b) => {
       const priority = (p: string) => {
         const lp = p.toLowerCase();
@@ -939,7 +1035,7 @@ async function generateContentWithRetry(
     preferredModel?: string;
   },
   maxRetries = 3
-) {
+): Promise<{ response: any; modelUsed: string }> {
   const targetModel = params.preferredModel || 'gemini-3.7-flash';
   const modelsToTry = [
     targetModel,
@@ -954,6 +1050,7 @@ async function generateContentWithRetry(
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const model = modelsToTry[Math.min(attempt, modelsToTry.length - 1)];
     try {
+      const ai = getGeminiClient();
       const response = await ai.models.generateContent({
         model,
         contents: params.contents,
@@ -963,7 +1060,7 @@ async function generateContentWithRetry(
           ...(params.responseMimeType ? { responseMimeType: params.responseMimeType } : {}),
         },
       });
-      return response;
+      return { response, modelUsed: model };
     } catch (err: any) {
       lastError = err;
       console.warn(`[Gemini Attempt ${attempt + 1} with ${model} failed]:`, err.message || err);
@@ -987,8 +1084,48 @@ async function generateContentWithRetry(
   throw lastError;
 }
 
+// Extract Citations using enhanced regex with support for spaces and special characters
+function extractCitationsFromText(text: string, files: SourceFile[]): Citation[] {
+  // Matches [path/to/file.tsx:L12-L24] or [my component.ts:L10] or [README.md:12-24]
+  const citationRegex = /\[([^\]:]+):L?(\d+)(?:-L?(\d+))?\]/g;
+  const citations: Citation[] = [];
+  let match;
+  const seenKeys = new Set<string>();
+
+  while ((match = citationRegex.exec(text)) !== null) {
+    const [, filePathRaw, startStr, endStr] = match;
+    const filePath = filePathRaw.trim();
+    const startLine = parseInt(startStr, 10);
+    const endLine = endStr ? parseInt(endStr, 10) : startLine;
+    const key = `${filePath}:${startLine}-${endLine}`;
+
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      const matchingFile = (files || []).find(
+        (f) => f.path.toLowerCase() === filePath.toLowerCase() || f.path.endsWith(filePath)
+      );
+      let snippet = '';
+      if (matchingFile) {
+        const lines = matchingFile.content.split('\n');
+        snippet = lines.slice(Math.max(0, startLine - 1), Math.min(lines.length, endLine)).join('\n');
+      }
+
+      citations.push({
+        id: `cit-${citations.length + 1}`,
+        filePath: matchingFile ? matchingFile.path : filePath,
+        startLine,
+        endLine,
+        snippet,
+        fileCategory: matchingFile?.fileCategory || determineFileCategory(filePath),
+      });
+    }
+  }
+
+  return citations;
+}
+
 // 7. Chat / Q&A endpoint using BM25 Inverted Index Context Budget Optimizer
-app.post('/api/repo/query', async (req, res) => {
+app.post('/api/repo/query', queryRateLimiter, async (req, res) => {
   const { question, repoSource, chunks, files, answerMode = 'detailed', model = 'gemini-3.7-flash' } = req.body;
 
   if (!question || !repoSource) {
@@ -996,9 +1133,9 @@ app.post('/api/repo/query', async (req, res) => {
   }
 
   try {
-    // Build token-budget-aware grounded context from BM25 index
-    const { contextString, retrievedChunks } = buildGroundedPromptContext(question, chunks || [], 9500);
-    const repoOutline = generateRepositoryOutline(files || [], 60);
+    // Build token-budget-aware grounded context from BM25 index (up to 12,000 tokens)
+    const { contextString, retrievedChunks } = buildGroundedPromptContext(question, chunks || [], 12000);
+    const repoOutline = generateRepositoryOutline(files || [], 80);
 
     const answerModeInstructions: Record<AnswerMode, string> = {
       concise: 'Provide a direct, concise response highlighting the essential facts and line references without fluff.',
@@ -1008,7 +1145,7 @@ app.post('/api/repo/query', async (req, res) => {
       beginner: 'Explain clearly with accessible metaphors and gentle walkthroughs, while still citing the exact source files.',
     };
 
-    const systemInstruction = `You are RepoNotebook, a repository-grounded assistant.
+    const systemInstruction = `You are RepoNotebook, a repository-grounded research assistant.
 Your ONLY knowledge source for this notebook is the repository: ${repoSource.fullName} (${repoSource.repoUrl}) on ref: ${repoSource.selectedRef}.
 
 CRITICAL GROUNDING RULES:
@@ -1021,7 +1158,7 @@ CRITICAL GROUNDING RULES:
 
     const promptText = `${repoOutline}\n\n${contextString}\n\nUser Question: ${question}\n\nAnswer with precise citations [filepath:L<start>-L<end>]:`;
 
-    const response = await generateContentWithRetry({
+    const { response, modelUsed } = await generateContentWithRetry({
       preferredModel: model,
       contents: promptText,
       systemInstruction,
@@ -1029,38 +1166,7 @@ CRITICAL GROUNDING RULES:
     });
 
     const replyText = response.text || 'I could not generate an answer from the repository context.';
-
-    // Extract Citations from reply text
-    const citationRegex = /\[([a-zA-Z0-9_\-./]+):L(\d+)(?:-L?(\d+))?\]/g;
-    const citations: Citation[] = [];
-    let match;
-    const seenKeys = new Set<string>();
-
-    while ((match = citationRegex.exec(replyText)) !== null) {
-      const [, filePath, startStr, endStr] = match;
-      const startLine = parseInt(startStr, 10);
-      const endLine = endStr ? parseInt(endStr, 10) : startLine;
-      const key = `${filePath}:${startLine}-${endLine}`;
-
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        const matchingFile = (files as SourceFile[] || []).find((f) => f.path === filePath);
-        let snippet = '';
-        if (matchingFile) {
-          const lines = matchingFile.content.split('\n');
-          snippet = lines.slice(Math.max(0, startLine - 1), Math.min(lines.length, endLine)).join('\n');
-        }
-
-        citations.push({
-          id: `cit-${citations.length + 1}`,
-          filePath,
-          startLine,
-          endLine,
-          snippet,
-          fileCategory: matchingFile?.fileCategory || 'code',
-        });
-      }
-    }
+    const citations = extractCitationsFromText(replyText, files || []);
 
     if (citations.length === 0 && retrievedChunks.length > 0 && !replyText.includes('could not find this')) {
       const top = retrievedChunks[0];
@@ -1088,8 +1194,8 @@ CRITICAL GROUNDING RULES:
         responseMimeType: 'application/json',
       });
 
-      if (followUpRes.text) {
-        const parsed = JSON.parse(followUpRes.text);
+      if (followUpRes.response?.text) {
+        const parsed = JSON.parse(followUpRes.response.text);
         if (Array.isArray(parsed) && parsed.length > 0) {
           suggestedFollowUps = parsed;
         }
@@ -1103,7 +1209,7 @@ CRITICAL GROUNDING RULES:
       citations,
       suggestedFollowUps,
       confidence: replyText.includes('could not find this') ? 'not_found' : 'grounded',
-      modelUsed: model,
+      modelUsed,
     });
   } catch (error: any) {
     console.error('Query error:', error);
@@ -1200,8 +1306,8 @@ app.post('/api/repo/artifact', async (req, res) => {
   const artifactSpec = typePrompts[artifactType as ArtifactType] || typePrompts.overview;
 
   try {
-    const { contextString } = buildGroundedPromptContext(artifactSpec.queryTerms, chunks || [], 11000);
-    const repoOutline = generateRepositoryOutline(files || [], 70);
+    const { contextString } = buildGroundedPromptContext(artifactSpec.queryTerms, chunks || [], 12000);
+    const repoOutline = generateRepositoryOutline(files || [], 80);
 
     const systemInstruction = `You are RepoNotebook's Research Artifact Engine.
 You are generating a formal research artifact for: ${repoSource.fullName}.
@@ -1209,37 +1315,14 @@ Ground everything strictly in the provided codebase context and cite files using
 
     const promptText = `${repoOutline}\n\n${contextString}\n\nArtifact Task: ${artifactSpec.instruction}\n\nGenerate the complete Markdown artifact titled "${artifactSpec.title}":`;
 
-    const response = await generateContentWithRetry({
+    const { response } = await generateContentWithRetry({
       contents: promptText,
       systemInstruction,
       temperature: 0.25,
     });
 
     const content = response.text || `# ${artifactSpec.title}\n\nCould not generate artifact.`;
-
-    // Extract Citations
-    const citationRegex = /\[([a-zA-Z0-9_\-./]+):L(\d+)(?:-L?(\d+))?\]/g;
-    const citations: Citation[] = [];
-    let match;
-    const seen = new Set<string>();
-
-    while ((match = citationRegex.exec(content)) !== null) {
-      const [, filePath, startStr, endStr] = match;
-      const startLine = parseInt(startStr, 10);
-      const endLine = endStr ? parseInt(endStr, 10) : startLine;
-      const key = `${filePath}:${startLine}-${endLine}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        const matchingFile = (files as SourceFile[] || []).find((f) => f.path === filePath);
-        citations.push({
-          id: `cit-art-${citations.length + 1}`,
-          filePath,
-          startLine,
-          endLine,
-          fileCategory: matchingFile?.fileCategory || 'code',
-        });
-      }
-    }
+    const citations = extractCitationsFromText(content, files || []);
 
     return res.json({
       artifact: {
@@ -1260,8 +1343,12 @@ Ground everything strictly in the provided codebase context and cite files using
 
 // Vite Middleware & SPA Serving
 async function startServer() {
-  // Ensure SQLite DB initialized
-  await getDatabase();
+  try {
+    // Ensure SQLite DB initialized
+    await getDatabase();
+  } catch (err) {
+    console.warn('[SQLite] Deferred initialization error:', err);
+  }
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -1282,4 +1369,11 @@ async function startServer() {
   });
 }
 
-startServer();
+export { app, startServer };
+
+// Auto-start when executed directly (not under test runners)
+if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+  startServer().catch((err) => {
+    console.error('[Server Fatal] Failed to start server:', err);
+  });
+}

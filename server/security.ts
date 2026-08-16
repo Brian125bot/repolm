@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 
 // Allowed root directories for local exploration
 const WORKSPACE_ROOT = path.resolve(process.cwd());
@@ -11,11 +12,13 @@ const FORBIDDEN_SYSTEM_PATHS = [
   '/sys',
   '/dev',
   '/root',
+  '/var',
   '/var/run',
   '/var/log',
   '/boot',
   '/bin',
   '/sbin',
+  '/usr',
   '/usr/bin',
   '/usr/sbin',
   '/lib',
@@ -66,10 +69,15 @@ export function validateLocalPath(rawPath: string | undefined): ValidationResult
 
   // 3. Resolve absolute path
   let targetPath: string;
-  if (path.isAbsolute(cleaned)) {
-    targetPath = path.normalize(cleaned);
+  let pathToResolve = cleaned;
+  if (pathToResolve.startsWith('~')) {
+    pathToResolve = path.join(os.homedir(), pathToResolve.slice(1));
+  }
+
+  if (path.isAbsolute(pathToResolve)) {
+    targetPath = path.normalize(pathToResolve);
   } else {
-    targetPath = path.resolve(WORKSPACE_ROOT, cleaned);
+    targetPath = path.resolve(WORKSPACE_ROOT, pathToResolve);
   }
 
   // 4. Denylist check for sensitive operating system directories
@@ -88,6 +96,8 @@ export function validateLocalPath(rawPath: string | undefined): ValidationResult
   if (
     normalizedLower.includes('/.ssh') ||
     normalizedLower.includes('/.aws') ||
+    normalizedLower.includes('/.kube') ||
+    normalizedLower.includes('/.docker') ||
     normalizedLower.includes('/.gnupg') ||
     normalizedLower.includes('/id_rsa') ||
     normalizedLower.includes('/id_ed25519') ||

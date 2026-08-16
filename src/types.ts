@@ -203,6 +203,7 @@ export interface LocalScanResult {
 }
 
 export interface StorageStats {
+  storageType?: string;
   totalNotebooks: number;
   totalFiles: number;
   totalChunks: number;
