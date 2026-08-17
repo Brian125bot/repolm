@@ -4,6 +4,7 @@ import {
   getAllNotebooks,
   getNotebookById,
   saveNotebook,
+  saveNotebooks,
   deleteNotebook,
   getStorageDiagnostics,
 } from '../server/db';
@@ -115,7 +116,15 @@ describe('SQLite Database & Storage Engine (server/db.ts)', () => {
         createdAt: new Date().toISOString(),
       },
     ],
-    pinnedCitations: [],
+    pinnedCitations: [
+      {
+        id: 'pin-1',
+        filePath: 'src/main.ts',
+        startLine: 1,
+        endLine: 15,
+        fileCategory: 'code',
+      },
+    ],
     suggestedQuestions: ['What does test-repo do?'],
   };
 
@@ -132,9 +141,10 @@ describe('SQLite Database & Storage Engine (server/db.ts)', () => {
     expect(tableNames).toContain('messages');
     expect(tableNames).toContain('notes');
     expect(tableNames).toContain('artifacts');
+    expect(tableNames).toContain('pinned_citations');
   });
 
-  it('should save a notebook with all nested files, chunks, messages, and artifacts', async () => {
+  it('should save a notebook with all nested files, chunks, messages, notes, artifacts, and pinned citations', async () => {
     await saveNotebook(mockNotebook);
 
     const retrieved = await getNotebookById(testNotebookId);
@@ -149,6 +159,54 @@ describe('SQLite Database & Storage Engine (server/db.ts)', () => {
     expect(retrieved?.messages[0].citations).toHaveLength(1);
     expect(retrieved?.notes).toHaveLength(1);
     expect(retrieved?.artifacts).toHaveLength(1);
+    expect(retrieved?.pinnedCitations).toHaveLength(1);
+  });
+
+  it('should update an existing notebook when saved again', async () => {
+    const updatedNb: Notebook = {
+      ...mockNotebook,
+      name: 'test-user/updated-repo-name',
+      notes: [
+        ...mockNotebook.notes,
+        {
+          id: `note-${testNotebookId}-2`,
+          notebookId: testNotebookId,
+          title: 'Second Note',
+          content: 'Additional notes.',
+          tags: ['architecture'],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          citations: [],
+        },
+      ],
+    };
+
+    await saveNotebook(updatedNb);
+    const retrieved = await getNotebookById(testNotebookId);
+    expect(retrieved?.name).toBe('test-user/updated-repo-name');
+    expect(retrieved?.notes).toHaveLength(2);
+  });
+
+  it('should bulk save notebooks with saveNotebooks', async () => {
+    const bulk1: Notebook = { ...mockNotebook, id: `bulk-1-${Date.now()}`, name: 'bulk/repo-1' };
+    const bulk2: Notebook = { ...mockNotebook, id: `bulk-2-${Date.now()}`, name: 'bulk/repo-2' };
+
+    await saveNotebooks([bulk1, bulk2]);
+
+    const res1 = await getNotebookById(bulk1.id);
+    const res2 = await getNotebookById(bulk2.id);
+
+    expect(res1?.name).toBe('bulk/repo-1');
+    expect(res2?.name).toBe('bulk/repo-2');
+
+    // Clean up bulk notebooks
+    await deleteNotebook(bulk1.id);
+    await deleteNotebook(bulk2.id);
+  });
+
+  it('should return null for non-existent notebook ID', async () => {
+    const res = await getNotebookById('non-existent-id-99999');
+    expect(res).toBeNull();
   });
 
   it('should list all notebooks in the SQLite database', async () => {
@@ -156,7 +214,7 @@ describe('SQLite Database & Storage Engine (server/db.ts)', () => {
     expect(all.length).toBeGreaterThanOrEqual(1);
     const found = all.find((n) => n.id === testNotebookId);
     expect(found).toBeDefined();
-    expect(found?.name).toBe('test-user/test-repo');
+    expect(found?.name).toBe('test-user/updated-repo-name');
   });
 
   it('should return accurate storage diagnostics', async () => {
@@ -174,5 +232,21 @@ describe('SQLite Database & Storage Engine (server/db.ts)', () => {
 
     const retrieved = await getNotebookById(testNotebookId);
     expect(retrieved).toBeNull();
+  });
+
+  it('should safely execute concurrent saves without database lock errors', async () => {
+    const concurrent1: Notebook = { ...mockNotebook, id: `conc-1-${Date.now()}`, name: 'conc/repo-1' };
+    const concurrent2: Notebook = { ...mockNotebook, id: `conc-2-${Date.now()}`, name: 'conc/repo-2' };
+
+    await Promise.all([saveNotebook(concurrent1), saveNotebook(concurrent2)]);
+
+    const res1 = await getNotebookById(concurrent1.id);
+    const res2 = await getNotebookById(concurrent2.id);
+
+    expect(res1).not.toBeNull();
+    expect(res2).not.toBeNull();
+
+    await deleteNotebook(concurrent1.id);
+    await deleteNotebook(concurrent2.id);
   });
 });

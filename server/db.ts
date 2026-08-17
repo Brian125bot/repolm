@@ -252,7 +252,7 @@ function insertNotebookInternal(db: Database, nb: Notebook): void {
   if (Array.isArray(nb.messages)) {
     for (const m of nb.messages) {
       db.run(
-        `INSERT INTO messages (id, notebook_id, role, content, citations_json, suggested_follow_ups_json, created_at, answer_mode, confidence, model_used)
+        `INSERT OR REPLACE INTO messages (id, notebook_id, role, content, citations_json, suggested_follow_ups_json, created_at, answer_mode, confidence, model_used)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [
           m.id,
@@ -274,7 +274,7 @@ function insertNotebookInternal(db: Database, nb: Notebook): void {
   if (Array.isArray(nb.notes)) {
     for (const n of nb.notes) {
       db.run(
-        `INSERT INTO notes (id, notebook_id, title, content, tags_json, citations_json, source_message_id, created_at, updated_at)
+        `INSERT OR REPLACE INTO notes (id, notebook_id, title, content, tags_json, citations_json, source_message_id, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [
           n.id,
@@ -295,7 +295,7 @@ function insertNotebookInternal(db: Database, nb: Notebook): void {
   if (Array.isArray(nb.artifacts)) {
     for (const a of nb.artifacts) {
       db.run(
-        `INSERT INTO artifacts (id, notebook_id, type, title, content, citations_json, created_at)
+        `INSERT OR REPLACE INTO artifacts (id, notebook_id, type, title, content, citations_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?);`,
         [a.id, nb.id, a.type, a.title, a.content, JSON.stringify(a.citations || []), a.createdAt]
       );
@@ -306,7 +306,7 @@ function insertNotebookInternal(db: Database, nb: Notebook): void {
   if (Array.isArray(nb.pinnedCitations)) {
     for (const p of nb.pinnedCitations) {
       db.run(
-        `INSERT INTO pinned_citations (id, notebook_id, citation_json, created_at)
+        `INSERT OR REPLACE INTO pinned_citations (id, notebook_id, citation_json, created_at)
          VALUES (?, ?, ?, ?);`,
         [p.id, nb.id, JSON.stringify(p), new Date().toISOString()]
       );
