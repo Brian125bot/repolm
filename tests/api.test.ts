@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import request from 'supertest';
 import { app } from '../server';
-import { getDatabase } from '../server/db';
+import { getDatabase, saveNotebook } from '../server/db';
+import { getSampleZustandNotebook } from '../src/sampleRepos';
 
 describe('Server API Endpoints Integration Tests (server.ts)', () => {
   beforeAll(async () => {
@@ -32,12 +33,31 @@ describe('Server API Endpoints Integration Tests (server.ts)', () => {
       expect(Array.isArray(res.body.notebooks)).toBe(true);
     });
 
-    it('POST /api/storage/notebooks rejects non-array payload with 400', async () => {
-      const res = await request(app)
+    it('POST /api/storage/notebooks saves notebooks array and rejects non-array', async () => {
+      const resInvalid = await request(app)
         .post('/api/storage/notebooks')
         .send({ notebooks: 'invalid' });
-      expect(res.status).toBe(400);
-      expect(res.body.error).toContain('Expected an array');
+      expect(resInvalid.status).toBe(400);
+      expect(resInvalid.body.error).toContain('Expected an array');
+
+      const sample = getSampleZustandNotebook();
+      sample.id = 'nb-test-api-save';
+      const resValid = await request(app)
+        .post('/api/storage/notebooks')
+        .send({ notebooks: [sample] });
+      expect(resValid.status).toBe(200);
+      expect(resValid.body.success).toBe(true);
+      expect(resValid.body.count).toBe(1);
+    });
+
+    it('DELETE /api/storage/notebooks/:id removes notebook by ID', async () => {
+      const sample = getSampleZustandNotebook();
+      sample.id = 'nb-test-to-delete';
+      await saveNotebook(sample);
+
+      const res = await request(app).delete(`/api/storage/notebooks/${sample.id}`);
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
     });
   });
 
@@ -48,6 +68,14 @@ describe('Server API Endpoints Integration Tests (server.ts)', () => {
         .send({ localPath: '../../../../etc' });
       expect(res.status).toBe(403);
       expect(res.body.error).toBeDefined();
+    });
+
+    it('POST /api/local/scan returns 404 for non-existent safe directory', async () => {
+      const res = await request(app)
+        .post('/api/local/scan')
+        .send({ localPath: 'src/non_existent_folder_xyz' });
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain('Directory not found');
     });
 
     it('POST /api/local/scan scans safe workspace directory successfully', async () => {
@@ -65,6 +93,16 @@ describe('Server API Endpoints Integration Tests (server.ts)', () => {
         .post('/api/local/ingest')
         .send({ localPath: '../../../../var/log' });
       expect(res.status).toBe(403);
+    });
+
+    it('POST /api/local/ingest successfully ingests valid local folder', async () => {
+      const res = await request(app)
+        .post('/api/local/ingest')
+        .send({ localPath: 'src/utils', folderName: 'test-utils' });
+      expect(res.status).toBe(200);
+      expect(res.body.notebook).toBeDefined();
+      expect(res.body.files.length).toBeGreaterThan(0);
+      expect(res.body.chunks.length).toBeGreaterThan(0);
     });
 
     it('POST /api/local/upload-folder validates uploaded files array', async () => {
@@ -95,7 +133,7 @@ describe('Server API Endpoints Integration Tests (server.ts)', () => {
     });
   });
 
-  describe('Validation on Query & Ingest Endpoints', () => {
+  describe('Validation & Ingestion Endpoints', () => {
     it('POST /api/repo/ingest returns 400 when repoUrl is missing', async () => {
       const res = await request(app)
         .post('/api/repo/ingest')
@@ -110,6 +148,16 @@ describe('Server API Endpoints Integration Tests (server.ts)', () => {
         .send({ repoUrl: 'not_a_valid_url' });
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('Invalid');
+    });
+
+    it('POST /api/repo/ingest handles demo repository pmndrs/zustand shortcut', async () => {
+      const res = await request(app)
+        .post('/api/repo/ingest')
+        .send({ repoUrl: 'https://github.com/pmndrs/zustand' });
+      expect(res.status).toBe(200);
+      expect(res.body.source.fullName).toBe('pmndrs/zustand');
+      expect(res.body.files.length).toBeGreaterThan(0);
+      expect(res.body.chunks.length).toBeGreaterThan(0);
     });
 
     it('POST /api/repo/query returns 400 when question or repoSource missing', async () => {
